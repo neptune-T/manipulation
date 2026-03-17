@@ -13,63 +13,108 @@ import os
 from isaacgym import gymutil
 from optimize_hoi import run_optimization
 # from pytorch3d.transforms import matrix_to_quaternion, quaternion_invert
-import xml.etree.ElementTree as ET
 import torch
+from fast_contact_calc import quat_to_matrix_xyzw
+from single_door_rl_task import annotate_single_door_records, parse_joint_info, select_single_door_task
 
-def parse_joint_info(urdf_path, target_link_name):
-    tree = ET.parse(urdf_path)
-    root = tree.getroot()
-    
-    child_to_joint = {}
-    for joint in root.findall('joint'):
-        child = joint.find('child')
-        if child is not None:
-            child_to_joint[child.get('link')] = joint
-            
-    # 1. 找到负责驱动把手的真实活动关节
-    active_joint = None
-    search_link = target_link_name
-    while search_link in child_to_joint:
-        joint = child_to_joint[search_link]
-        if joint.get('type') in ['revolute', 'prismatic', 'continuous']:
-            active_joint = joint
-            break
-        search_link = joint.find('parent').get('link')
-        
-    if active_joint is None:
-        return None, None, None
-        
-    # 2. 收集从 base 到 active_joint 的完整路径 (包含 fixed 关节)
-    path = []
-    curr = active_joint
-    while curr is not None:
-        path.append(curr)
-        parent_link = curr.find('parent').get('link')
-        curr = child_to_joint.get(parent_link)
-    path.reverse() # 从 root 到 leaf
-    
-    # 3. 累加所有的 origin 变换，计算基坐标系下的真实 Axis 和 Origin
-    current_rot = R.identity()
-    current_pos = np.zeros(3)
-    
-    for joint in path:
-        origin = joint.find('origin')
-        xyz = np.array([float(x) for x in origin.get('xyz').split()]) if origin is not None and origin.get('xyz') else np.zeros(3)
-        rpy = np.array([float(x) for x in origin.get('rpy').split()]) if origin is not None and origin.get('rpy') else np.zeros(3)
-        
-        # 当前层级的局部轴向 (只有到达 active_joint 时才提取 axis并返回)
-        if joint == active_joint:
-            axis = joint.find('axis')
-            local_axis = np.array([float(x) for x in axis.get('xyz').split()]) if axis is not None and axis.get('xyz') else np.array([0, 0, 1])
-            true_axis = current_rot.apply(local_axis)
-            true_origin = current_pos + current_rot.apply(xyz)
-            return joint.get('type'), true_origin, true_axis
-            
-        # 累加 fixed 关节的变换
-        current_pos = current_pos + current_rot.apply(xyz)
-        current_rot = current_rot * R.from_euler('xyz', rpy)
-        
-    return None, None, None
+
+def has_revolute_gapart(urdf_path):
+    """Check whether this object has at least one gapart link driven by revolute/continuous joint."""
+    anno_path = os.path.join(os.path.dirname(urdf_path), "link_annotation_gapartnet.json")
+    if not os.path.exists(anno_path):
+        return False
+    with open(anno_path, "r") as f:
+        annos = json.load(f)
+
+    for anno in annos:
+        if not anno.get("is_gapart", False):
+            continue
+        link_name = anno.get("link_name")
+        if link_name is None:
+            continue
+        j_type, _, _, _, _, _ = parse_joint_info(urdf_path, link_name)
+        if j_type in ["revolute", "continuous"]:
+            return True
+    return False
+
+
+def _build_handle_point_cloud_from_collision_mesh(
+    gym,
+    obj_urdf_path,
+    link_name,
+    handle_center,
+    handle_out,
+    num_points=1500,
+    points_per_link=2500,
+    backside_margin=None,
+):
+    """
+    尝试从目标 link 的 collision mesh 采样表面点云（世界坐标）。
+    并可选过滤出把手“背后”区域（沿 handle_out 的负方向）。
+    """
+    try:
+        gym._ensure_contact_calc(
+            obj_urdf_path=obj_urdf_path,
+            points_per_link=max(int(points_per_link), int(num_points)),
+            hand_points_per_link=200,
+        )
+        if not hasattr(gym, "contact_calc"):
+            return None
+
+        cc = gym.contact_calc
+        if link_name not in cc.link_pcs:
+            return None
+
+        # object dof (B=1)
+        obj_qpos = gym.dof_pos[
+            0,
+            gym.mano_num_dofs : gym.mano_num_dofs + gym.arti_obj_num_dofs,
+            0,
+        ].unsqueeze(0)
+        obj_dict = {name: obj_qpos[:, i] for i, name in enumerate(cc.obj_joint_names)}
+        obj_ret = cc.obj_chain.forward_kinematics(obj_dict)
+        if link_name not in obj_ret:
+            return None
+
+        link_tf = obj_ret[link_name].get_matrix()
+        link_rot = link_tf[:, :3, :3]
+        link_trans = link_tf[:, :3, 3]
+        local_points = cc.link_pcs[link_name]
+        points_obj = (torch.matmul(local_points, link_rot.transpose(1, 2)) + link_trans.unsqueeze(1)) * cc.obj_scale
+
+        o_pos = torch.tensor(gym.arti_init_obj_pos_list[0], dtype=torch.float32, device=gym.device).unsqueeze(0)
+        o_rot = torch.tensor(gym.arti_init_obj_rot_list[0], dtype=torch.float32, device=gym.device).unsqueeze(0)
+        obj_rot_mat = quat_to_matrix_xyzw(o_rot)
+        points_world = torch.matmul(points_obj, obj_rot_mat.transpose(1, 2)) + o_pos.unsqueeze(1)
+        points_world = points_world.squeeze(0)
+
+        # 可选过滤：取把手背后的 patch（四指插入区域）
+        if backside_margin is not None:
+            center_t = torch.tensor(handle_center, dtype=torch.float32, device=points_world.device)
+            out_t = torch.tensor(handle_out, dtype=torch.float32, device=points_world.device)
+            out_t = out_t / (torch.norm(out_t) + 1e-6)
+            proj = torch.sum((points_world - center_t) * out_t, dim=-1)
+            mask_back = proj < -float(backside_margin)
+            if mask_back.any():
+                back_points = points_world[mask_back]
+                # 只有当背后点数足够时才替换，避免空洞/误判导致点云过稀
+                if back_points.shape[0] >= max(50, num_points // 4):
+                    points_world = back_points
+
+        # 采样到固定数量（可重复采样）
+        if points_world.shape[0] <= 0:
+            return None
+        if points_world.shape[0] >= num_points:
+            idx = torch.randperm(points_world.shape[0], device=points_world.device)[:num_points]
+            points_world = points_world[idx]
+        else:
+            idx = torch.randint(0, points_world.shape[0], (num_points,), device=points_world.device)
+            points_world = points_world[idx]
+
+        return points_world
+    except Exception as e:
+        print(f"⚠️ collision handle_pc 构建失败: {e}")
+        return None
 
 def generate_kinematic_trajectory(start_pose_6d, joint_type, world_origin, world_axis, open_amount=0.15, steps=100, **kwargs):
     """
@@ -77,6 +122,17 @@ def generate_kinematic_trajectory(start_pose_6d, joint_type, world_origin, world
     修复：将位移和旋转合并成标准的 [N, 7] 轨迹数组，适配 Isaac Gym 接口。
     """
     combined_traj = []
+
+    # 兼容旧调用：amount -> open_amount
+    if "amount" in kwargs and kwargs["amount"] is not None:
+        open_amount = kwargs["amount"]
+
+    # 保证旋转/平移轴为单位向量，避免幅度被 axis 长度污染
+    world_axis = np.asarray(world_axis, dtype=np.float64)
+    axis_norm = np.linalg.norm(world_axis)
+    if axis_norm < 1e-8:
+        raise ValueError(f"Invalid world_axis: {world_axis}")
+    world_axis = world_axis / axis_norm
     
     # 【自适应解包逻辑】
     start_arr = np.array(start_pose_6d)
@@ -190,7 +246,7 @@ if args.mode == "run_arti_free_control":
     
     # we choose one example object to show the demo, change the path 
     # to the object you want to show!
-    paths = ["../partnet_mobility_part/45661/mobility_annotation_gapartnet.urdf"]
+    paths = ["../partnet_mobility_part/9117/mobility_annotation_gapartnet.urdf"]
     for path in tqdm.tqdm(paths, total=len(paths)):
         gapart_id = path.split("/")[-2]
         cfgs = read_yaml_config(f"{args.config}.yaml")
@@ -246,6 +302,18 @@ elif args.mode == "run_arti_open":
     # read all paths
     # we choose one example object to show the demo, change the path
     paths = glob.glob(f"assets/{ROOT}/*/mobility_annotation_gapartnet.urdf")
+    preferred_gapart_id = "11304"
+    preferred_path = f"assets/{ROOT}/{preferred_gapart_id}/mobility_annotation_gapartnet.urdf"
+    if os.path.exists(preferred_path):
+        paths = [preferred_path]
+        print(f"🎯 优先测试指定对象: {preferred_gapart_id}")
+    else:
+        revolute_paths = [p for p in paths if has_revolute_gapart(p)]
+        if len(revolute_paths) > 0:
+            paths = revolute_paths
+            print(f"🔁 已切换到旋转任务集合: {len(paths)} / {len(glob.glob(f'assets/{ROOT}/*/mobility_annotation_gapartnet.urdf'))}")
+        else:
+            print("⚠️ 未筛到旋转对象，回退到原始对象集合。")
     for path in tqdm.tqdm(paths, total=len(paths)):
         # get gapart id and anno
         gapart_id = path.split("/")[-2]
@@ -274,6 +342,16 @@ elif args.mode == "run_arti_open":
         cfgs["HEADLESS"] = args.headless
         cfgs["USE_CUROBO"] = False
         cfgs["asset"]["arti_obj_root"] = ROOT
+        # 旋转把手抓取需要更小的 contact_offset / thickness，避免“空气层”太厚导致无法插入把手背后
+        if has_revolute_gapart(path):
+            cfgs["asset"]["arti_shape_contact_offset"] = 0.005
+            cfgs["asset"]["arti_shape_thickness"] = 0.02
+            # 旋转任务需要更强的摩擦与手指夹持力，才能把门“拖动”起来
+            cfgs["asset"]["mano_shape_contact_offset"] = 0.005
+            cfgs["asset"]["mano_shape_thickness"] = 0.02
+            cfgs["asset"]["mano_shape_friction"] = 5.0
+            cfgs["asset"]["mano_dof_stiffness"] = 400.0
+            cfgs["asset"]["mano_dof_damping"] = 30.0
         cfgs["asset"]["arti_position_noise"] = 0.0
         cfgs["asset"]["arti_rotation_noise"] = 0.0
         cfgs["asset"]["arti_obj_scale"] = 0.4
@@ -317,9 +395,15 @@ elif args.mode == "run_arti_open":
                                 np.array([1, 0 ,0], dtype=np.float32))
         
         
-        # manipulate the object with the last part, change it for other objects
-        # get the part bbox and calculate the handle direction
-        bbox_id = -1
+        task_spec = select_single_door_task(
+            asset_dir=os.path.dirname(path),
+            door_index=0,
+        )
+        bbox_id = int(task_spec.handle_bbox_index)
+        print(
+            f"✅ 单门任务已锁定: door={task_spec.door_link_name}, "
+            f"handle={task_spec.handle_link_name}, joint={task_spec.joint_name}, bbox_id={bbox_id}"
+        )
         
         # 将所有的 bbox 转换为 Tensor
         all_bbox_now_tensor = torch.tensor(all_bbox_now, dtype=torch.float32).to(gym.device).reshape(-1, 8, 3)
@@ -341,12 +425,39 @@ elif args.mode == "run_arti_open":
         init_position = all_bbox_center_front_face[bbox_id].cpu().numpy()
         handle_out_ = handle_out[bbox_id].cpu().numpy()
         handle_short_ = handle_short[bbox_id].cpu().numpy()
+        handle_long_ = handle_long[bbox_id].cpu().numpy()
         init_rotation = rotations[bbox_id].cpu().numpy()
-        
-        bbox_min = all_bbox_now[bbox_id].min(axis=0)
-        bbox_max = all_bbox_now[bbox_id].max(axis=0)
-        dense_pc = np.random.uniform(bbox_min, bbox_max, size=(1000, 3))
-        handle_point_cloud = torch.tensor(dense_pc, dtype=torch.float32, device=gym.device)
+
+        # ------------------------------------------
+        # handle_pc: 旋转任务优先用 collision mesh 表面点云
+        # ------------------------------------------
+        obj_urdf_path = os.path.join(
+            gym.asset_root,
+            gym.gapartnet_root,
+            str(gym.gapartnet_ids[0]),
+            "mobility_annotation_gapartnet.urdf",
+        )
+        handle_link_name = task_spec.handle_link_name
+        handle_joint_type = task_spec.joint_type
+        print(f"🧩 用 collision mesh 采样 handle_pc, link={handle_link_name}, joint_type={handle_joint_type}")
+        handle_point_cloud = _build_handle_point_cloud_from_collision_mesh(
+            gym=gym,
+            obj_urdf_path=obj_urdf_path,
+            link_name=handle_link_name,
+            handle_center=init_position,
+            handle_out=handle_out_,
+            num_points=1500,
+            points_per_link=2500,
+            backside_margin=None,
+        )
+        if handle_point_cloud is None:
+            print(f"🧩 handle_pc 回退到 bbox 采样, link={handle_link_name}, joint_type={handle_joint_type}")
+            # fallback：平移任务保持原逻辑；旋转任务尽量取“背后”区域
+            bbox_min = all_bbox_now[bbox_id].min(axis=0)
+            bbox_max = all_bbox_now[bbox_id].max(axis=0)
+            dense_pc = np.random.uniform(bbox_min, bbox_max, size=(1000, 3))
+            handle_point_cloud = torch.tensor(dense_pc, dtype=torch.float32, device=gym.device)
+        print(f"🧩 handle_pc 点数: {int(handle_point_cloud.shape[0])}")
         
         print(f"🎯 锁定目标把手，中心位置: {init_position}")
 
@@ -357,7 +468,7 @@ elif args.mode == "run_arti_open":
         # 1. 设定手部的初始姿态 (在把手正前方 10 厘米处，准备抓取)
         # pre_grasp_position = init_position + 0.10 * handle_out_
         pre_grasp_position = init_position + 0.06 * handle_out_
-        mano_urdf_path = "../urdf/mano.urdf"
+        mano_urdf_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "urdf", "mano.urdf"))
         
         opt_pos, opt_rot, opt_qpos = run_optimization(
             mano_urdf_path=mano_urdf_path,
@@ -366,13 +477,33 @@ elif args.mode == "run_arti_open":
             handle_pc=handle_point_cloud,  
             handle_center=init_position,
             handle_out=handle_out_,
-            handle_long=handle_long
+            handle_long=handle_long_
         )
         
         # 3. 将优化得到的位姿打包
         # 优化得到的完美结果
         opt_pose_6d = np.concatenate([opt_pos, opt_rot])
-        
+
+        # ==========================================
+        # 🤝 动作 2.5: 基于“手部表面点->物体表面点”距离的接触稳定
+        # ==========================================
+        # 在拉动前先让手指闭合并结算若干帧；若接触不足则沿 -handle_out_ 方向微推入把手
+        # obj_urdf_path 已在 handle_pc 构建时生成，这里复用
+        opt_pose_6d, grasp_stable, grasp_info = gym.stabilize_grasp_by_surface_contact(
+            start_pose_6d=opt_pose_6d,
+            target_qpos=opt_qpos,
+            approach_dir=-handle_out_,
+            obj_urdf_path=obj_urdf_path,
+            surface_contact_thresh=0.015,
+            min_contact_points=60,
+            required_contact_links=["index3", "middle3", "ring3", "pinky3", "thumb3"],
+            min_points_per_link=3,
+            settle_steps=8,
+            max_iters=12,
+            push_step=0.002,
+        )
+        print(f"🤝 稳定接触: {grasp_stable}, info={grasp_info}")
+
         # 设定手部初始的“完全张开”状态
         open_qpos = np.zeros_like(opt_qpos)
         
@@ -386,17 +517,18 @@ elif args.mode == "run_arti_open":
         # 自动匹配: 从 bbox_id 获取真实的 link_name 和运动类型
         # ==========================================
         # 假设当前场景只有 1 个可动部件物体 (索引为 0)
-        target_link = gym.gapart_link_names[0][bbox_id] 
-        urdf_file = path 
-        
-        print(f"🔍 正在解析部件: {target_link} ...")
-        
-        # 自动去 URDF 查这个部件是 "旋转" 还是 "平移"，以及它的轴(axis)和中心(origin)
-        j_type, local_origin, local_axis = parse_joint_info(urdf_file, target_link)
-        
-        print(f"⚙️ 识别到关节类型: {j_type}, 运动轴: {local_axis}")
-        
-        j_type, local_origin, local_axis = parse_joint_info(urdf_file, target_link)
+        target_link = task_spec.handle_link_name
+        target_cate = task_spec.handle_category
+
+        print(f"🔍 正在解析部件: {target_link} ({target_cate}) ...")
+
+        j_type = task_spec.joint_type
+        local_origin = task_spec.joint_origin_local
+        local_axis = task_spec.joint_axis_local
+        joint_name = task_spec.joint_name
+        joint_lower = task_spec.joint_lower
+        joint_upper = task_spec.joint_upper
+        print(f"⚙️ 识别到关节类型: {j_type}, 关节名: {joint_name}, 运动轴: {local_axis}, limit=({joint_lower}, {joint_upper})")
         
         if j_type is not None:
             # 获取物体在 Gym 中的缩放和平移信息
@@ -411,38 +543,85 @@ elif args.mode == "run_arti_open":
             # 轴向量只受旋转影响
             world_axis = obj_rot_mat.apply(local_axis)
             
-            # 设定要打开的角度或距离 (例如：开门 1.0 弧度，约 57 度)
-            open_amount = 1.0 if j_type in ["revolute", "continuous"] else 0.15 
-            
-            # 生成随动的轨迹
+            obj_dof_index = gym.arti_obj_dof_dict.get(joint_name, None) if joint_name is not None else None
+
+            # 设定要打开的角度或距离
+            # 平移分支保持你原来的 0.15，不动；
+            # 旋转分支改为基于关节当前值到极限的增量。
+            open_amount = 1.0 if j_type in ["revolute", "continuous"] else 0.15
+            if j_type in ["revolute", "continuous"] and obj_dof_index is not None:
+                if joint_lower is not None and joint_upper is not None:
+                    current_obj_dof = gym.dof_pos[0, gym.mano_num_dofs + obj_dof_index, 0].item()
+                    delta_upper = float(joint_upper - current_obj_dof)
+                    delta_lower = float(joint_lower - current_obj_dof)
+                    open_amount = delta_upper if abs(delta_upper) >= abs(delta_lower) else delta_lower
+                elif joint_upper is not None:
+                    current_obj_dof = gym.dof_pos[0, gym.mano_num_dofs + obj_dof_index, 0].item()
+                    open_amount = float(joint_upper - current_obj_dof)
+                open_amount = float(np.clip(open_amount, -1.2, 1.2))
+
+            # 按你的要求：旋转也采用和平移一致的开环手部轨迹规划，
+            # 不依赖 obj_dof 反馈，避免“物体不先动 -> 手不继续动”的停滞。
             hand_traj = generate_kinematic_trajectory(
                 joint_type=j_type,
                 world_axis=world_axis,
                 world_origin=world_origin,
                 start_pose_6d=opt_pose_6d,
-                amount=open_amount,
+                open_amount=open_amount,
                 steps=100
             )
-            
-            # 执行跟随轨迹控制
-            # gym.follow_trajectory(traj_poses=hand_traj, target_qpos=opt_qpos)
-            # 1. 执行轨迹并记录 (获得 60 帧的原始运动状态)
-            records = gym.follow_trajectory_and_record(traj_poses=hand_traj, target_qpos=opt_qpos)
+
+            drive_dof_delta_thresh = 0.01 if j_type == "prismatic" else 0.05
+            records = gym.follow_trajectory_and_record(
+                traj_poses=hand_traj,
+                target_qpos=opt_qpos,
+                record_surface_contact=True,
+                surface_contact_thresh=0.015,
+                min_contact_points=60,
+                required_contact_links=["index3", "middle3", "ring3", "pinky3", "thumb3"],
+                min_points_per_link=3,
+                drive_dof_index=obj_dof_index,
+                drive_dof_delta_thresh=drive_dof_delta_thresh,
+                set_root_velocities=j_type in ["revolute", "continuous"],
+            )
+            if len(records) > 0:
+                records[0]["grasp_stable_init"] = bool(grasp_stable)
+                records[0]["grasp_info_init"] = grasp_info
+
+            if obj_dof_index is not None and len(records) > 1:
+                try:
+                    init_dof = float(records[0]["obj_dof"][obj_dof_index])
+                    final_dof = float(records[-1]["obj_dof"][obj_dof_index])
+                    delta_dof = final_dof - init_dof
+                    stable_frames = [r.get("surface_contact_stable", False) for r in records]
+                    stable_ratio = float(sum(bool(x) for x in stable_frames)) / float(len(stable_frames))
+                    print(
+                        f"📈 运动结果: dof[{obj_dof_index}] {init_dof:.4f} -> {final_dof:.4f} (Δ={delta_dof:.4f}), "
+                        f"stable_ratio={stable_ratio:.2f}"
+                    )
+                except Exception:
+                    pass
             
             # 2. 获取当前环境物体的 URDF 路径和绝对位置
 
             # 🌟 加上 gym.asset_root，拼接成完整的真实路径！
-            obj_urdf_path = os.path.join(
-                gym.asset_root, 
-                gym.gapartnet_root, 
-                str(gym.gapartnet_ids[0]), 
-                "mobility_annotation_gapartnet.urdf"
-            )
+            # obj_urdf_path 已在稳定接触阶段构建，这里复用
             
             obj_world_pos = gym.arti_init_obj_pos_list[0]
             obj_world_rot = gym.arti_init_obj_rot_list[0]
             
             # 3. 送入 GPU 结算接触，并保存为 Dataset
+            phase_summary = annotate_single_door_records(
+                records_list=records,
+                task_spec=task_spec,
+                obj_world_pos=obj_world_pos,
+                obj_world_rot=obj_world_rot,
+                obj_scale=obj_scale,
+                contact_target_points=6,
+                min_contact_points=30,
+            )
+            print(f"🧠 单门 phase 标注: {phase_summary}")
+
             save_file = f"output/dataset/grasp_record_{gym.gapartnet_ids[0]}.json"
             gym.process_and_save_dataset(
                 records_list=records,

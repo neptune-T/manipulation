@@ -138,6 +138,8 @@ class ObjectGym():
         self.sim = self.gym.create_sim(self.args.compute_device_id, self.args.graphics_device_id, self.args.physics_engine, sim_params)
         if self.sim is None:
             raise Exception("Failed to create sim")
+        self.sim_params = sim_params
+        self.sim_dt = float(getattr(sim_params, "dt", 1.0 / 60.0))
 
         # create viewer
         if not self.headless:
@@ -399,10 +401,21 @@ class ObjectGym():
     #     # print("franka dof:", self.franka_num_dofs, "franka links:", self.franka_num_links)
     #     self.franka_hand_index = franka_link_dict["panda_hand"]
 
+    def _resolve_mano_urdf_path(self):
+        module_dir = os.path.dirname(os.path.abspath(__file__))
+        default_mano_root = os.path.abspath(os.path.join(module_dir, "..", "urdf"))
+        mano_asset_root = self.cfgs.get("asset", {}).get("mano_asset_root", default_mano_root)
+        mano_asset_file = self.cfgs.get("asset", {}).get("mano_asset_file", "mano.urdf")
+        if not os.path.isabs(mano_asset_root):
+            mano_asset_root = os.path.abspath(os.path.join(module_dir, mano_asset_root))
+        mano_asset_path = os.path.join(mano_asset_root, mano_asset_file)
+        return mano_asset_root, mano_asset_file, mano_asset_path
+
 
     def prepare_mano_asset(self):
-        mano_asset_root = "../urdf"     
-        mano_asset_file = "mano.urdf"
+        mano_asset_root, mano_asset_file, mano_asset_path = self._resolve_mano_urdf_path()
+        if not os.path.exists(mano_asset_path):
+            raise FileNotFoundError(f"MANO URDF not found: {mano_asset_path}")
         
         asset_options = gymapi.AssetOptions()
         asset_options.override_inertia = True 
@@ -427,8 +440,17 @@ class ObjectGym():
         print(f"成功加载 MANO 手，检测到 {self.mano_num_dofs} 个自由度。")
 
         self.mano_dof_props["driveMode"].fill(gymapi.DOF_MODE_POS)
-        self.mano_dof_props["stiffness"].fill(100.0) 
-        self.mano_dof_props["damping"].fill(10.0)
+        mano_stiffness = float(self.cfgs.get("asset", {}).get("mano_dof_stiffness", 100.0))
+        mano_damping = float(self.cfgs.get("asset", {}).get("mano_dof_damping", 10.0))
+        mano_effort = self.cfgs.get("asset", {}).get("mano_dof_effort", None)
+        self.mano_dof_props["stiffness"].fill(mano_stiffness)
+        self.mano_dof_props["damping"].fill(mano_damping)
+        # Effort limit caps the joint motor torque/force; too small => weak grasp.
+        if mano_effort is not None:
+            try:
+                self.mano_dof_props["effort"].fill(float(mano_effort))
+            except Exception:
+                pass
 
         self.mano_default_dof_pos = np.zeros(self.mano_num_dofs, dtype=np.float32)
         
@@ -494,6 +516,16 @@ class ObjectGym():
         arti_obj_asset_options.default_dof_drive_mode = gymapi.DOF_MODE_NONE
         arti_obj_asset_options.disable_gravity = False
         arti_obj_asset_options.flip_visual_attachments = False
+
+        # GAPartNet URDFs often omit inertial tags; computing inertia/COM from geometry
+        # prevents links from becoming effectively immovable due to invalid inertial data.
+        if bool(self.cfgs.get("asset", {}).get("arti_obj_override_inertia", True)):
+            arti_obj_asset_options.override_inertia = True
+        if bool(self.cfgs.get("asset", {}).get("arti_obj_override_com", True)):
+            arti_obj_asset_options.override_com = True
+        arti_density = self.cfgs.get("asset", {}).get("arti_obj_density", None)
+        if arti_density is not None and hasattr(arti_obj_asset_options, "density"):
+            arti_obj_asset_options.density = float(arti_density)
         
         # unused settings, be careful, otherwise it will cause error
         # arti_obj_asset_options.thickness = 0.02
@@ -511,15 +543,21 @@ class ObjectGym():
         ### TODO: support multiple loading from here
         self.arti_obj_asset = self.arti_obj_assets[0]
         self.arti_obj_num_dofs = self.gym.get_asset_dof_count(self.arti_obj_asset)
+        self.arti_obj_dof_dict = self.gym.get_asset_dof_dict(self.arti_obj_asset)
+        self.arti_obj_dof_names = list(self.arti_obj_dof_dict.keys())
         arti_obj_link_dict = self.gym.get_asset_rigid_body_dict(self.arti_obj_asset)
         self.arti_obj_num_links = len(arti_obj_link_dict)
         print("obj dof:", self.arti_obj_num_dofs, "obj links:", self.arti_obj_num_links)
+        print("obj dof names:", self.arti_obj_dof_names)
         
         # set physical props
         self.arti_obj_dof_props = self.gym.get_asset_dof_properties(self.arti_obj_asset)
-        # self.arti_obj_dof_props['stiffness'][:] = 10.0 
-        self.arti_obj_dof_props['damping'][:] = 10.0      # large damping can reduce interia(?)
-        # self.arti_obj_dof_props['friction'][:] = 5.0
+        arti_obj_dof_stiffness = float(self.cfgs.get("asset", {}).get("arti_obj_dof_stiffness", 0.0))
+        arti_obj_dof_damping = float(self.cfgs.get("asset", {}).get("arti_obj_dof_damping", 10.0))
+        arti_obj_dof_friction = float(self.cfgs.get("asset", {}).get("arti_obj_dof_friction", 0.0))
+        self.arti_obj_dof_props["stiffness"][:] = arti_obj_dof_stiffness
+        self.arti_obj_dof_props["damping"][:] = arti_obj_dof_damping
+        self.arti_obj_dof_props["friction"][:] = arti_obj_dof_friction
         self.arti_obj_dof_props["driveMode"][:] = gymapi.DOF_MODE_NONE
         
         
@@ -608,6 +646,20 @@ class ObjectGym():
             self.gym.set_actor_dof_states(env, mano_handle, self.mano_default_dof_state, gymapi.STATE_ALL)
             self.gym.set_actor_dof_position_targets(env, mano_handle, self.mano_default_dof_pos)
 
+            mano_contact_offset = self.cfgs.get("asset", {}).get("mano_shape_contact_offset", None)
+            mano_friction = self.cfgs.get("asset", {}).get("mano_shape_friction", None)
+            mano_thickness = self.cfgs.get("asset", {}).get("mano_shape_thickness", None)
+            if mano_contact_offset is not None or mano_friction is not None or mano_thickness is not None:
+                mano_shape_props = self.gym.get_actor_rigid_shape_properties(env, mano_handle)
+                for prop in mano_shape_props:
+                    if mano_contact_offset is not None:
+                        prop.contact_offset = float(mano_contact_offset)
+                    if mano_friction is not None:
+                        prop.friction = float(mano_friction)
+                    if mano_thickness is not None:
+                        prop.thickness = float(mano_thickness)
+                self.gym.set_actor_rigid_shape_properties(env, mano_handle, mano_shape_props)
+
             # 记录根节点索引，以后如果你想动态平移手掌会用到
             hand_idx = self.gym.find_actor_rigid_body_index(env, mano_handle, "palm", gymapi.DOMAIN_SIM)
             self.hand_idxs.append(hand_idx)
@@ -671,22 +723,31 @@ class ObjectGym():
                 ### TODO check
                 # self.arti_obj_default_dof_state["pos"][:3] = 2 + np.random.uniform(-1.0, 1.0) * 0.5
                 self.gym.set_actor_dof_states(env, arti_obj_actor_handle, self.arti_obj_default_dof_state, gymapi.STATE_ALL)
-                # set initial position targets
-                self.gym.set_actor_dof_position_targets(env, arti_obj_actor_handle, self.arti_obj_default_dof_state["pos"])
+                # Only set dof targets if the articulation is actually driven.
+                # For DOF_MODE_NONE, setting targets is unnecessary and can be confusing.
+                try:
+                    driven = np.any(self.arti_obj_dof_props["driveMode"] != gymapi.DOF_MODE_NONE)
+                except Exception:
+                    driven = False
+                if driven:
+                    self.gym.set_actor_dof_position_targets(env, arti_obj_actor_handle, self.arti_obj_default_dof_state["pos"])
                 arti_obj_actor_idx = self.gym.get_actor_rigid_body_index(env, arti_obj_actor_handle, 0, gymapi.DOMAIN_SIM)
                 self.arti_obj_actor_idxs.append(arti_obj_actor_idx)
                 self.gym.set_actor_scale(env, arti_obj_actor_handle, self.cfgs["asset"]["arti_obj_scale"])
                 
                 agent_shape_props = self.gym.get_actor_rigid_shape_properties(env, arti_obj_actor_handle)
+                arti_contact_offset = float(self.cfgs.get("asset", {}).get("arti_shape_contact_offset", 0.02))
+                arti_friction = float(self.cfgs.get("asset", {}).get("arti_shape_friction", 5.0))
+                arti_thickness = float(self.cfgs.get("asset", {}).get("arti_shape_thickness", 0.2))
                 for agent_shape_prop in agent_shape_props:
                     # agent_shape_prop.compliance = agent.rigid_shape_compliance
-                    agent_shape_prop.contact_offset = 0.02 # 0.001
+                    agent_shape_prop.contact_offset = arti_contact_offset  # 0.001
                     # agent_shape_prop.filter = agent.rigid_shape_filter
-                    agent_shape_prop.friction = 5.0
+                    agent_shape_prop.friction = arti_friction
                     # agent_shape_prop.rest_offset = agent.rigid_shape_rest_offset
                     # agent_shape_prop.restitution = agent.rigid_shape_restitution
                     # agent_shape_prop.rolling_friction = agent.rigid_shape_rolling_friction
-                    agent_shape_prop.thickness = 0.2
+                    agent_shape_prop.thickness = arti_thickness
                     # agent_shape_prop.torsion_friction = agent.rigid_shape_torsion_friction
                 self.gym.set_actor_rigid_shape_properties(env, arti_obj_actor_handle, agent_shape_props)  
             
@@ -837,8 +898,39 @@ class ObjectGym():
         self.dof_pos = self.dof_states[:, 0].view(self.num_envs, num_dof, 1)
         self.dof_vel = self.dof_states[:, 1].view(self.num_envs, num_dof, 1)
 
+    def _mano_actor_indices_tensor(self) -> torch.Tensor:
+        """Global actor indices (DOMAIN_SIM) for MANO actors, as int32 tensor."""
+        if not hasattr(self, "mano_actor_idxs") or len(self.mano_actor_idxs) == 0:
+            return torch.zeros((0,), dtype=torch.int32, device=self.device)
+        idx = getattr(self, "_mano_actor_idxs_tensor", None)
+        if idx is None or idx.numel() != len(self.mano_actor_idxs):
+            idx = torch.as_tensor(self.mano_actor_idxs, dtype=torch.int32, device=self.device)
+            self._mano_actor_idxs_tensor = idx
+        return idx
+
+    def _set_mano_root_state_tensor(self, root_states: torch.Tensor) -> None:
+        """
+        Only set the root state for MANO actors.
+
+        This avoids accidentally overwriting the root state of other dynamic actors
+        (e.g. YCB objects), which can make them appear "stuck" during interaction.
+        """
+        mano_actor_idxs = self._mano_actor_indices_tensor()
+        if mano_actor_idxs.numel() == 0:
+            # Fallback: keep legacy behavior if MANO actor indices are missing.
+            self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(root_states))
+            return
+        self.gym.set_actor_root_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(root_states),
+            gymtorch.unwrap_tensor(mano_actor_idxs),
+            int(mano_actor_idxs.numel()),
+        )
+
     def refresh_observation(self, get_visual_obs = True):
         # refresh tensors
+        # Keep root states in sync; several controllers "teleport" the MANO root.
+        self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_jacobian_tensors(self.sim)
@@ -1148,7 +1240,7 @@ class ObjectGym():
             root_states[mano_idx, 3:7] = torch.tensor(pose_from_optim[3:], dtype=torch.float32, device=self.device)
             root_states[mano_idx, 7:13] = 0.0 # 动量清零
             
-        self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(root_states))
+        self._set_mano_root_state_tensor(root_states)
 
         # 获取当前环境中所有自由度 (手 + 物体) 的当前目标值，Shape: (num_envs, 23)
         pos_action = self.dof_pos.squeeze(-1).clone() 
@@ -1190,7 +1282,7 @@ class ObjectGym():
                 root_states[mano_idx, :3] = torch.tensor(current_pos, dtype=torch.float32, device=self.device)
                 root_states[mano_idx, 3:7] = torch.tensor(current_rot, dtype=torch.float32, device=self.device)
                 root_states[mano_idx, 7:13] = 0.0 # 消除惯性
-            self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(root_states))
+            self._set_mano_root_state_tensor(root_states)
             
             # 3. 更新手指关节目标角度 (Target Tensor)
             pos_action = self.dof_pos.squeeze(-1).clone() 
@@ -1201,48 +1293,377 @@ class ObjectGym():
             self.run_steps(pre_steps=1, refresh_obs=True, print_step=False)
             time.sleep(0.01) # 微微暂停，让你肉眼能看清动作过程
 
-    def follow_trajectory_and_record(self, traj_poses, target_qpos):
+    def _get_current_arti_obj_urdf_path(self):
+        if not self.cfgs.get("USE_ARTI", False):
+            return None
+        if not hasattr(self, "gapartnet_root") or not hasattr(self, "gapartnet_ids"):
+            return None
+        if len(self.gapartnet_ids) == 0:
+            return None
+        return os.path.join(
+            self.asset_root,
+            self.gapartnet_root,
+            str(self.gapartnet_ids[0]),
+            "mobility_annotation_gapartnet.urdf",
+        )
+
+    def _ensure_contact_calc(self, obj_urdf_path, points_per_link=1000, hand_points_per_link=200):
+        if obj_urdf_path is None:
+            return
+        if hasattr(self, "contact_calc") and getattr(self, "_contact_calc_obj_urdf_path", None) == obj_urdf_path:
+            return
+
+        _, _, mano_urdf = self._resolve_mano_urdf_path()
+        obj_scale = 1.0
+        try:
+            obj_scale = float(self.cfgs.get("asset", {}).get("arti_obj_scale", 1.0))
+        except Exception:
+            obj_scale = 1.0
+        self.contact_calc = FastContactCalculator(
+            mano_urdf,
+            obj_urdf_path,
+            device=self.device,
+            obj_scale=obj_scale,
+            points_per_link=points_per_link,
+            hand_points_per_link=hand_points_per_link,
+        )
+        self._contact_calc_obj_urdf_path = obj_urdf_path
+
+    def _compute_surface_contact_summary(
+        self,
+        hand_pose_6d,
+        obj_urdf_path,
+        surface_contact_thresh=0.015,
+    ):
+        self._ensure_contact_calc(obj_urdf_path=obj_urdf_path)
+        if not hasattr(self, "contact_calc"):
+            return 0, {}, float("inf")
+
+        h_pos = torch.tensor(hand_pose_6d[:3], dtype=torch.float32, device=self.device).unsqueeze(0)
+        h_rot = torch.tensor(hand_pose_6d[3:7], dtype=torch.float32, device=self.device).unsqueeze(0)
+        h_qpos = self.dof_pos[0, : self.mano_num_dofs, 0].unsqueeze(0)
+
+        o_pos = torch.tensor(self.arti_init_obj_pos_list[0], dtype=torch.float32, device=self.device).unsqueeze(0)
+        o_rot = torch.tensor(self.arti_init_obj_rot_list[0], dtype=torch.float32, device=self.device).unsqueeze(0)
+        o_qpos = self.dof_pos[
+            0, self.mano_num_dofs : self.mano_num_dofs + self.arti_obj_num_dofs, 0
+        ].unsqueeze(0)
+
+        contact_mask, min_dists, link_counts = self.contact_calc.compute_batch_surface_contact(
+            h_pos,
+            h_rot,
+            h_qpos,
+            o_pos,
+            o_rot,
+            o_qpos,
+            thresh=surface_contact_thresh,
+        )
+        contact_count = int(contact_mask.to(torch.int32).sum().item())
+        min_dist = float(min_dists.min().item())
+        link_counts_int = {k: int(v.item()) for k, v in link_counts.items()}
+        return contact_count, link_counts_int, min_dist
+
+    def stabilize_grasp_by_surface_contact(
+        self,
+        start_pose_6d,
+        target_qpos,
+        approach_dir=None,
+        obj_urdf_path=None,
+        surface_contact_thresh=0.015,
+        min_contact_points=60,
+        required_contact_links=None,
+        min_points_per_link=5,
+        settle_steps=8,
+        max_iters=12,
+        push_step=0.002,
+    ):
         """
-        按照预计算好的 6D 轨迹列表，逐帧移动手腕并记录数据！
+        基于“手部表面点 -> 物体表面点”的距离阈值生成二值接触标签，并在拉动前做稳定接触。
+
+        策略：
+        - 固定手腕姿态+目标手指 qpos，让物理引擎先结算若干帧；
+        - 计算接触点数量与每个手指 link 的接触点数量；
+        - 若不满足阈值，则沿 approach_dir 微推入把手，重复以上过程。
         """
-        import time
+        if obj_urdf_path is None:
+            obj_urdf_path = self._get_current_arti_obj_urdf_path()
+        if obj_urdf_path is None:
+            return np.array(start_pose_6d), False, {"reason": "no_obj_urdf"}
+
+        pose = np.array(start_pose_6d, dtype=np.float32).copy()
+        target_qpos_tensor = torch.tensor(target_qpos, dtype=torch.float32, device=self.device)
+
+        best_pose = pose.copy()
+        best_count = -1
+        best_info = {}
+
+        if required_contact_links is None:
+            required_contact_links = []
+
+        for it in range(max_iters):
+            root_states = self.root_states.clone()
+            for env_i in range(self.num_envs):
+                mano_idx = self.mano_actor_idxs[env_i]
+                root_states[mano_idx, :3] = torch.tensor(pose[:3], dtype=torch.float32, device=self.device)
+                root_states[mano_idx, 3:7] = torch.tensor(pose[3:7], dtype=torch.float32, device=self.device)
+                root_states[mano_idx, 7:13] = 0.0
+            self._set_mano_root_state_tensor(root_states)
+
+            pos_action = self.dof_pos.squeeze(-1).clone()
+            pos_action[:, : self.mano_num_dofs] = target_qpos_tensor
+            self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(pos_action))
+
+            self.run_steps(pre_steps=settle_steps, refresh_obs=True, print_step=False)
+
+            contact_count, link_counts, min_dist = self._compute_surface_contact_summary(
+                hand_pose_6d=pose,
+                obj_urdf_path=obj_urdf_path,
+                surface_contact_thresh=surface_contact_thresh,
+            )
+
+            links_in_contact = sum(1 for v in link_counts.values() if v >= min_points_per_link)
+            required_links_ok = True
+            if len(required_contact_links) > 0:
+                required_links_ok = all(
+                    link_counts.get(link_name, 0) >= min_points_per_link
+                    for link_name in required_contact_links
+                )
+            stable = (contact_count >= min_contact_points) and required_links_ok
+
+            info = {
+                "iter": it,
+                "contact_count": contact_count,
+                "links_in_contact": links_in_contact,
+                "required_links_ok": required_links_ok,
+                "min_dist": min_dist,
+                "link_counts": link_counts,
+            }
+
+            if contact_count > best_count:
+                best_count = contact_count
+                best_pose = pose.copy()
+                best_info = info
+
+            if stable:
+                return pose, True, info
+
+            if approach_dir is None:
+                break
+
+            pose[:3] = pose[:3] + np.asarray(approach_dir, dtype=np.float32) * float(push_step)
+
+        return best_pose, False, best_info
+
+    def follow_trajectory_and_record(
+        self,
+        traj_poses,
+        target_qpos,
+        record_surface_contact=False,
+        surface_contact_thresh=0.015,
+        min_contact_points=None,
+        required_contact_links=None,
+        min_points_per_link=3,
+        drive_dof_index=None,
+        drive_dof_delta_thresh=None,
+        set_root_velocities=False,
+        max_root_lin_vel=3.0,
+        max_root_ang_vel=12.0,
+    ):
+        """
+        按照预计算好的 6D 轨迹列表，逐帧移动手腕并记录数据。
+        """
         records_list = []
-        
+        target_qpos_tensor = torch.tensor(target_qpos, dtype=torch.float32, device=self.device)
+        obj_urdf_path = None
+        if record_surface_contact and self.cfgs.get("USE_ARTI", False):
+            obj_urdf_path = self._get_current_arti_obj_urdf_path()
+            self._ensure_contact_calc(obj_urdf_path=obj_urdf_path)
+
+        if required_contact_links is None:
+            required_contact_links = []
+
+        init_drive_dof_val = None
+        prev_pos = None
+        prev_rot = None
+        dt = float(getattr(self, "sim_dt", 1.0 / 60.0))
         for frame_idx, pose in enumerate(traj_poses):
             current_pos = pose[:3]
-            current_rot = pose[3:] 
-            
-            # 1. 更新手腕位置 (沿着真实轨迹)
+            current_rot = pose[3:]
+
             root_states = self.root_states.clone()
             for env_i in range(self.num_envs):
                 mano_idx = self.mano_actor_idxs[env_i]
                 root_states[mano_idx, :3] = torch.tensor(current_pos, dtype=torch.float32, device=self.device)
                 root_states[mano_idx, 3:7] = torch.tensor(current_rot, dtype=torch.float32, device=self.device)
-                root_states[mano_idx, 7:13] = 0.0 # 消除惯性
-            self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(root_states))
+                if set_root_velocities and prev_pos is not None and prev_rot is not None and dt > 0:
+                    lin_vel = (np.asarray(current_pos, dtype=np.float32) - np.asarray(prev_pos, dtype=np.float32)) / dt
+                    try:
+                        rel_rotvec = (R.from_quat(current_rot) * R.from_quat(prev_rot).inv()).as_rotvec()
+                        ang_vel = np.asarray(rel_rotvec, dtype=np.float32) / dt
+                    except Exception:
+                        ang_vel = np.zeros(3, dtype=np.float32)
+
+                    if max_root_lin_vel is not None:
+                        lin_speed = float(np.linalg.norm(lin_vel))
+                        if lin_speed > float(max_root_lin_vel) > 1e-8:
+                            lin_vel = lin_vel / lin_speed * float(max_root_lin_vel)
+                    if max_root_ang_vel is not None:
+                        ang_speed = float(np.linalg.norm(ang_vel))
+                        if ang_speed > float(max_root_ang_vel) > 1e-8:
+                            ang_vel = ang_vel / ang_speed * float(max_root_ang_vel)
+
+                    root_states[mano_idx, 7:10] = torch.tensor(lin_vel, dtype=torch.float32, device=self.device)
+                    root_states[mano_idx, 10:13] = torch.tensor(ang_vel, dtype=torch.float32, device=self.device)
+                else:
+                    root_states[mano_idx, 7:13] = 0.0
+            self._set_mano_root_state_tensor(root_states)
+
+            pos_action = self.dof_pos.squeeze(-1).clone()
+            pos_action[:, :self.mano_num_dofs] = target_qpos_tensor
+            self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(pos_action))
+
+            self.run_steps(pre_steps=1, refresh_obs=True, print_step=False)
+
+            current_hand_qpos = (
+                self.dof_pos[0, : self.mano_num_dofs, 0].detach().cpu().numpy().tolist()
+            )
+            current_obj_dof = self.dof_pos[
+                0, self.mano_num_dofs:self.mano_num_dofs + self.arti_obj_num_dofs, 0
+            ].cpu().numpy().tolist()
+
+            record = {
+                "frame": frame_idx,
+                "hand_pos": current_pos.tolist(),
+                "hand_rot": current_rot.tolist(),
+                # Store the *actual* qpos from simulation (used later for contact labels).
+                "hand_qpos": current_hand_qpos,
+                "hand_qpos_target": target_qpos_tensor.detach().cpu().numpy().tolist(),
+                "obj_dof": current_obj_dof
+            }
+
+            if drive_dof_index is not None and isinstance(drive_dof_index, (int, np.integer)):
+                if 0 <= int(drive_dof_index) < len(current_obj_dof):
+                    drive_val = float(current_obj_dof[int(drive_dof_index)])
+                    if init_drive_dof_val is None:
+                        init_drive_dof_val = drive_val
+                    drive_delta = drive_val - float(init_drive_dof_val)
+                    record["drive_dof_index"] = int(drive_dof_index)
+                    record["drive_dof_val"] = float(drive_val)
+                    record["drive_dof_delta"] = float(drive_delta)
+                    if drive_dof_delta_thresh is not None:
+                        moved = abs(drive_delta) >= float(drive_dof_delta_thresh)
+                        record["obj_moved"] = bool(moved)
+
+            records_list.append(record)
+
+            if record_surface_contact and obj_urdf_path is not None and hasattr(self, "contact_calc"):
+                contact_count, link_counts, min_dist = self._compute_surface_contact_summary(
+                    hand_pose_6d=pose,
+                    obj_urdf_path=obj_urdf_path,
+                    surface_contact_thresh=surface_contact_thresh,
+                )
+                records_list[-1]["surface_contact_count"] = int(contact_count)
+                records_list[-1]["surface_contact_link_counts"] = link_counts
+                records_list[-1]["surface_contact_min_dist"] = float(min_dist)
+                if min_contact_points is not None or len(required_contact_links) > 0:
+                    required_links_ok = True
+                    if len(required_contact_links) > 0:
+                        required_links_ok = all(
+                            link_counts.get(link_name, 0) >= int(min_points_per_link)
+                            for link_name in required_contact_links
+                        )
+                    stable = (contact_count >= int(min_contact_points or 0)) and required_links_ok
+                    records_list[-1]["surface_contact_stable"] = bool(stable)
+                    records_list[-1]["surface_required_links_ok"] = bool(required_links_ok)
+                    if "obj_moved" in records_list[-1]:
+                        records_list[-1]["can_drive_object"] = bool(stable and records_list[-1]["obj_moved"])
+
+            prev_pos = current_pos
+            prev_rot = current_rot
+
+        return records_list
+    
+    def closed_loop_interactive_open(self, start_pose_6d, target_qpos, world_origin, world_axis, joint_type, target_amount, obj_dof_index, steps=100):
+        """
+        闭环牵引控制：根据物体的实时物理反馈来更新手腕位置
+        """
+        import numpy as np
+        from scipy.spatial.transform import Rotation as R
+        import time
+        
+        records_list = []
+        
+        # 拆解初始手部姿态
+        hand_pos_init = start_pose_6d[:3]
+        hand_rot_init = R.from_quat(start_pose_6d[3:7])
+        
+        # 每一帧的超前引导量（类似弹簧被拉伸的长度）
+        # 保证正/负目标都能平滑推进
+        lead_delta = abs(target_amount / steps) * 1.5 
+        
+        for step_i in range(steps):
+            # 1. 【核心】获取物体的真实物理状态
+            # 读取柜门/抽屉当前的真实位置或角度
+            current_obj_dof = self.dof_pos[0, self.mano_num_dofs + obj_dof_index, 0].item()
             
-            # 2. 保持手指处于收紧状态
+            # 2. 计算引导目标（永远比真实状态超前一点点，形成牵引力）
+            # 注意不要超过最终的 target_amount；兼容正向/反向旋转
+            if target_amount >= current_obj_dof:
+                guided_amount = min(current_obj_dof + lead_delta, target_amount)
+            else:
+                guided_amount = max(current_obj_dof - lead_delta, target_amount)
+            
+            # 3. 实时计算手腕此刻应该在的绝对正确位置
+            if joint_type in ['revolute', 'continuous']:
+                # 完美的圆弧旋转几何计算
+                rot_vec = world_axis * guided_amount
+                delta_R = R.from_rotvec(rot_vec)
+                vec_to_hand = hand_pos_init - world_origin
+                
+                target_pos = world_origin + delta_R.apply(vec_to_hand)
+                target_rot = (delta_R * hand_rot_init).as_quat()
+                
+            elif joint_type == 'prismatic':
+                # 直线平移计算
+                target_pos = hand_pos_init + world_axis * guided_amount
+                target_rot = start_pose_6d[3:7] # 姿态不变
+            else:
+                target_pos = hand_pos_init
+                target_rot = start_pose_6d[3:7]
+                
+            # 4. 执行手腕的传送与手指的抓紧
+            root_states = self.root_states.clone()
+            for env_i in range(self.num_envs):
+                mano_idx = self.mano_actor_idxs[env_i]
+                root_states[mano_idx, :3] = torch.tensor(target_pos, dtype=torch.float32, device=self.device)
+                root_states[mano_idx, 3:7] = torch.tensor(target_rot, dtype=torch.float32, device=self.device)
+                root_states[mano_idx, 7:13] = 0.0 # 清除速度，避免物理引擎过度补偿
+                
+            self._set_mano_root_state_tensor(root_states)
+            
+            # 保持手指闭合
             pos_action = self.dof_pos.squeeze(-1).clone() 
             pos_action[:, :self.mano_num_dofs] = torch.tensor(target_qpos, dtype=torch.float32, device=self.device)
             self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(pos_action))
             
-            # 3. 步进物理引擎
+            # 5. 步进物理仿真
             self.run_steps(pre_steps=1, refresh_obs=True, print_step=False)
             
-            # 我们从 dof_pos 张量中提取出属于柜门/抽屉的自由度角度
-            current_obj_dof = self.dof_pos[0, self.mano_num_dofs : self.mano_num_dofs + self.arti_obj_num_dofs, 0].cpu().numpy().tolist()
-            
-            # 记录本帧的状态到列表中
+            # 6. 记录高仿真数据
+            current_hand_qpos = (
+                self.dof_pos[0, : self.mano_num_dofs, 0].detach().cpu().numpy().tolist()
+            )
+            current_obj_dof_all = self.dof_pos[0, self.mano_num_dofs : self.mano_num_dofs + self.arti_obj_num_dofs, 0].cpu().numpy().tolist()
             records_list.append({
-                "frame": frame_idx,
-                "hand_pos": current_pos.tolist(),
-                "hand_rot": current_rot.tolist(),
-                "hand_qpos": target_qpos.tolist(),
-                "obj_dof": current_obj_dof
+                "frame": step_i,
+                "hand_pos": target_pos.tolist(),
+                "hand_rot": target_rot.tolist(),
+                "hand_qpos": current_hand_qpos,
+                "hand_qpos_target": np.asarray(target_qpos).tolist(),
+                "obj_dof": current_obj_dof_all
             })
             
-            # 如果是在大批量生成数据集，可以把下面这行 sleep 注释掉以极速运行
-            time.sleep(0.01) 
+            # time.sleep(0.01) # 肉眼观察调试用
             
         return records_list
 
@@ -1251,10 +1672,8 @@ class ObjectGym():
         """
         在轨迹录制完成后，将整个 records_list 送入 GPU 瞬间计算接触标签并保存。
         """
-        # 如果是第一次调用，初始化接触计算器并挂载在 self 上以复用
-        if not hasattr(self, 'contact_calc'):
-            mano_urdf = "../urdf/mano.urdf" # 确保路径正确
-            self.contact_calc = FastContactCalculator(mano_urdf, obj_urdf_path, device=self.device, points_per_link=1000)
+        # 初始化/复用接触计算器（按 URDF 路径区分，避免对象切换时复用错）
+        self._ensure_contact_calc(obj_urdf_path=obj_urdf_path, points_per_link=1000, hand_points_per_link=200)
 
         B = len(records_list)
         

@@ -1,5 +1,3 @@
-# Copyright (c) 2023 Chaoyang Wang, Carnegie Mellon University.
-
 import os
 import sys
 
