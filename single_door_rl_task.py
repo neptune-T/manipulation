@@ -337,6 +337,12 @@ class SingleDoorRewardConfig:
     penetration_progress_penalty: float = 8.0
     palm_penetration_penalty: float = 10.0
     fingertip_penetration_allowance: float = 0.0035
+    sdf_contact_weight: float = 0.8
+    sdf_penetration_weight: float = 1.2
+    sdf_target_margin: float = 0.002
+    sdf_far_margin: float = 0.015
+    outside_grasp_bonus_gate: float = 0.45
+    outside_grasp_penalty: float = 4.0
 
 
 def select_single_door_task(asset_dir: str, door_index: int = 0, preferred_door_link: Optional[str] = None, preferred_handle_link: Optional[str] = None) -> SingleDoorTaskSpec:
@@ -470,6 +476,33 @@ def compute_force_closure_score(
     closure_contact = min(thumb, finger_wall)
     alignment_term = _clip_unit(0.65 * handle_out_alignment + 0.35 * tangent_alignment)
     return float(closure_contact * (0.55 + 0.45 * finger_support) * alignment_term)
+
+
+def compute_sdf_contact_score(min_dist: float, target_margin: float = 0.002, far_margin: float = 0.015) -> float:
+    if not np.isfinite(min_dist):
+        return 0.0
+    if min_dist < 0.0:
+        return float(max(0.0, 1.0 - abs(min_dist) / max(target_margin, 1e-6)))
+    if min_dist <= target_margin:
+        return 1.0
+    if min_dist >= far_margin:
+        return 0.0
+    return float(1.0 - (min_dist - target_margin) / max(far_margin - target_margin, 1e-6))
+
+
+def compute_outside_grasp_score(
+    link_counts: Dict[str, int],
+    force_closure_reward: float,
+    palm_contact_cap: float = 0.25,
+    target_points: int = 6,
+) -> float:
+    thumb = _clip_unit(link_counts.get("thumb3", 0) / float(target_points))
+    index = _clip_unit(link_counts.get("index3", 0) / float(target_points))
+    middle = _clip_unit(link_counts.get("middle3", 0) / float(target_points))
+    palm = _clip_unit(link_counts.get("palm", 0) / float(2 * target_points))
+    finger_wall = _clip_unit(0.5 * (index + middle))
+    palm_suppression = _clip_unit(1.0 - palm / max(palm_contact_cap, 1e-6))
+    return float(min(thumb, finger_wall) * (0.5 + 0.5 * force_closure_reward) * palm_suppression)
 
 
 def build_contact_feature_vector(link_counts: Dict[str, int], target_points: int = 6) -> np.ndarray:
@@ -774,6 +807,16 @@ def compute_single_door_reward(
         handle_out_alignment=align_out,
         tangent_alignment=tangent_axis_alignment,
     )
+    sdf_contact_reward = compute_sdf_contact_score(
+        state.surface_contact_min_dist,
+        target_margin=cfg.sdf_target_margin,
+        far_margin=cfg.sdf_far_margin,
+    )
+    outside_grasp_score = compute_outside_grasp_score(
+        state.surface_contact_link_counts,
+        force_closure_reward=force_closure_reward,
+        target_points=cfg.contact_target_points,
+    )
     force_closure_gate = _clip_unit(
         (force_closure_reward - cfg.force_closure_gate_threshold) / max(1e-6, 1.0 - cfg.force_closure_gate_threshold)
     )
@@ -802,6 +845,7 @@ def compute_single_door_reward(
         if progress_delta > 0.0:
             progress_reward = 0.0
             tangent_reward = 0.0
+    sdf_penetration_penalty = float(max(0.0, -state.surface_contact_min_dist))
     palm_contact = float(state.surface_contact_link_counts.get("palm", 0))
     fingertip_contact = float(
         state.surface_contact_link_counts.get("thumb3", 0)
@@ -821,10 +865,12 @@ def compute_single_door_reward(
             action_smooth = float(np.mean(np.square(action_arr - prev_action_arr)))
 
     success = bool(state.progress >= cfg.success_progress)
+    outside_grasp_ok = bool(outside_grasp_score >= cfg.outside_grasp_bonus_gate)
     total = (
         cfg.reach_weight * reach_reward
         + cfg.align_weight * align_reward
         + cfg.contact_weight * contact_reward
+        + cfg.sdf_contact_weight * sdf_contact_reward
         + cfg.opposition_weight * opposition_reward
         + cfg.force_closure_weight * force_closure_reward
         + cfg.hold_weight * hold_reward
@@ -833,10 +879,12 @@ def compute_single_door_reward(
         + cfg.tangent_weight * tangent_reward
         - cfg.detach_penalty_weight * detach_penalty
         - cfg.penetration_progress_penalty * penetration_penalty
+        - cfg.sdf_penetration_weight * sdf_penetration_penalty
         - cfg.palm_penetration_penalty * palm_penalty
+        - (0.0 if outside_grasp_ok else cfg.outside_grasp_penalty * max(0.0, state.progress))
         - cfg.action_l2_weight * action_l2
         - cfg.action_smooth_weight * action_smooth
-        + (cfg.success_bonus if success else 0.0)
+        + (cfg.success_bonus if (success and outside_grasp_ok) else 0.0)
     )
 
     return {
@@ -846,9 +894,12 @@ def compute_single_door_reward(
         "align": float(align_reward),
         "raw_align": float(raw_align_reward),
         "contact": float(contact_reward),
+        "sdf_contact": float(sdf_contact_reward),
         "opposition": float(opposition_reward),
         "force_closure": float(force_closure_reward),
         "force_closure_gate": float(force_closure_gate),
+        "outside_grasp": float(outside_grasp_score),
+        "outside_grasp_ok": float(outside_grasp_ok),
         "hold": float(hold_reward),
         "pinch": float(pinch_reward),
         "pinch_gate": float(pinch_gate),
@@ -857,8 +908,10 @@ def compute_single_door_reward(
         "tangent": float(tangent_reward),
         "detach_penalty": float(detach_penalty),
         "penetration_penalty": float(penetration_penalty),
+        "sdf_penetration_penalty": float(sdf_penetration_penalty),
         "palm_penalty": float(palm_penalty),
         "action_l2_penalty": float(action_l2),
         "action_smooth_penalty": float(action_smooth),
         "success": float(success),
+        "success_bonus_active": float(success and outside_grasp_ok),
     }

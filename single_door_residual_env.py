@@ -985,6 +985,12 @@ class SingleDoorResidualEnv:
             pose[:3] = pose[:3] - signed_dist * plane_normal
         return pose.astype(np.float32)
 
+    def _door_plane_violation(self, runtime_state) -> float:
+        plane_normal = runtime_state.handle_out_world
+        plane_point = runtime_state.handle_front_center_world - float(self.config.palm_safe_buffer) * plane_normal
+        signed_dist = float(np.dot(runtime_state.hand_pos - plane_point, plane_normal))
+        return float(max(0.0, -signed_dist))
+
     def reset(self, phase: Optional[str] = None, pose_noise: Optional[float] = None, rot_noise: Optional[float] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
         reset_phase = self.config.reset_phase if phase is None else phase
         if phase is None and self.config.curriculum_enabled:
@@ -1034,6 +1040,7 @@ class SingleDoorResidualEnv:
             "progress": float(self.prev_state.progress),
             "surface_contact_count": int(self.prev_state.surface_contact_count),
             "surface_contact_stable": bool(self.prev_state.surface_contact_stable),
+            "door_plane_violation": float(self._door_plane_violation(self.prev_state)),
             "contact_features": _to_jsonable(build_contact_feature_vector(self.prev_state.surface_contact_link_counts)),
             "contact_target": _to_jsonable(get_phase_contact_target(self.get_curriculum_phase())),
             "contact_link_order": list(CONTACT_LINK_ORDER),
@@ -1137,6 +1144,7 @@ class SingleDoorResidualEnv:
             "drive_dof_vel": float(state.drive_dof_vel),
             "surface_contact_count": int(state.surface_contact_count),
             "surface_contact_stable": bool(state.surface_contact_stable),
+            "door_plane_violation": float(self._door_plane_violation(state)),
             "surface_contact_link_counts": dict(state.surface_contact_link_counts),
             "pinch_debug": {
                 "thumb3": int(state.surface_contact_link_counts.get("thumb3", 0)),
