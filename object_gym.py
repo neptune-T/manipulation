@@ -1,8 +1,4 @@
-from numpy_compat import ensure_numpy_legacy_aliases
 
-ensure_numpy_legacy_aliases()
-
-from isaacgym import gymapi
 from isaacgym import gymutil
 from isaacgym import gymtorch
 from isaacgym.torch_utils import *
