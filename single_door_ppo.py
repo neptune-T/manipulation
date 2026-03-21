@@ -19,6 +19,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 
 @dataclass
 class PPOConfig:
@@ -37,9 +42,15 @@ class PPOConfig:
     action_std_init: float = 0.35
     save_every: int = 20
     bc_coef: float = 0.1
+    bc_coef_min: float = 0.01
+    bc_coef_decay: float = 0.90
     contact_aux_coef: float = 0.2
     value_clip: float = 0.2
     teacher_forcing_coef: float = 0.25
+    teacher_forcing_min: float = 0.05
+    teacher_forcing_decay: float = 0.90
+    teacher_forcing_success_threshold: float = 0.80
+    teacher_forcing_window: int = 20
 
 
 class ActorCritic(nn.Module):
@@ -81,9 +92,9 @@ class ActorCritic(nn.Module):
 
 def compute_gae(rewards, dones, values, next_value, gamma, gae_lambda):
     advantages = np.zeros_like(rewards, dtype=np.float32)
-    last_adv = 0.0
+    last_adv = np.zeros_like(rewards[0], dtype=np.float32)
     for step in reversed(range(len(rewards))):
-        next_non_terminal = 1.0 - float(dones[step])
+        next_non_terminal = 1.0 - np.asarray(dones[step], dtype=np.float32)
         next_val = next_value if step == len(rewards) - 1 else values[step + 1]
         delta = rewards[step] + gamma * next_val * next_non_terminal - values[step]
         last_adv = delta + gamma * gae_lambda * next_non_terminal * last_adv
@@ -128,25 +139,37 @@ def main():
     parser.add_argument("--asset-dir", type=str, default=os.path.join(os.path.dirname(__file__), "assets", "gapartnet_example", "11712"))
     parser.add_argument("--config", type=str, default="config.yaml")
     parser.add_argument("--door-index", type=int, default=0)
+    parser.add_argument("--num-envs", type=int, default=1)
     parser.add_argument("--headless", action="store_true", default=False)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save-dir", type=str, default="output/single_door_ppo")
-    parser.add_argument("--total-updates", type=int, default=200)
+    parser.add_argument("--total-updates", type=int, default=500)
     parser.add_argument("--rollout-steps", type=int, default=256)
     parser.add_argument("--reset-phase", type=str, default="grasp", choices=["approach", "grasp"])
     parser.add_argument("--reset-pose-noise", type=float, default=0.002)
     parser.add_argument("--reset-rot-noise", type=float, default=0.02)
     parser.add_argument("--policy-init-std", type=float, default=0.35)
     parser.add_argument("--bc-coef", type=float, default=0.1)
+    parser.add_argument("--bc-coef-min", type=float, default=0.01)
+    parser.add_argument("--bc-coef-decay", type=float, default=0.90)
     parser.add_argument("--teacher-forcing-coef", type=float, default=0.25)
+    parser.add_argument("--teacher-forcing-min", type=float, default=0.05)
+    parser.add_argument("--teacher-forcing-decay", type=float, default=0.90)
+    parser.add_argument("--teacher-forcing-success-threshold", type=float, default=0.80)
+    parser.add_argument("--teacher-forcing-window", type=int, default=20)
     parser.add_argument("--contact-aux-coef", type=float, default=0.2)
     parser.add_argument("--curriculum-enabled", action="store_true", default=False)
+    parser.add_argument("--wandb", action="store_true", default=False)
+    parser.add_argument("--wandb-project", type=str, default="gapartnet-hoi")
+    parser.add_argument("--wandb-name", type=str, default="")
+    parser.add_argument("--wandb-entity", type=str, default="")
     args = parser.parse_args()
 
     env_cfg = SingleDoorResidualConfig(
         asset_dir=args.asset_dir,
         config_path=args.config,
         door_index=args.door_index,
+        num_envs=int(args.num_envs),
         headless=bool(args.headless),
         device=args.device,
         reset_phase=args.reset_phase,
@@ -159,16 +182,47 @@ def main():
         rollout_steps=int(args.rollout_steps),
         action_std_init=float(args.policy_init_std),
         bc_coef=float(args.bc_coef),
+        bc_coef_min=float(args.bc_coef_min),
+        bc_coef_decay=float(args.bc_coef_decay),
         contact_aux_coef=float(args.contact_aux_coef),
         teacher_forcing_coef=float(args.teacher_forcing_coef),
+        teacher_forcing_min=float(args.teacher_forcing_min),
+        teacher_forcing_decay=float(args.teacher_forcing_decay),
+        teacher_forcing_success_threshold=float(args.teacher_forcing_success_threshold),
+        teacher_forcing_window=int(args.teacher_forcing_window),
     )
 
     env = SingleDoorResidualEnv(env_cfg)
     torch_device = torch.device(args.device)
+    wandb_run = None
 
     try:
+        if bool(args.wandb):
+            if wandb is None:
+                raise ImportError("wandb is not installed. Please `pip install wandb` in your env.")
+            wandb_init_kwargs = {
+                "project": args.wandb_project,
+                "config": _to_jsonable(
+                    {
+                        "env_cfg": asdict(env_cfg),
+                        "ppo_cfg": asdict(ppo_cfg),
+                        "asset_dir": args.asset_dir,
+                        "device": args.device,
+                    }
+                ),
+            }
+            if args.wandb_name:
+                wandb_init_kwargs["name"] = args.wandb_name
+            if args.wandb_entity:
+                wandb_init_kwargs["entity"] = args.wandb_entity
+            wandb_run = wandb.init(**wandb_init_kwargs)
+
         obs, reset_info = env.reset()
-        obs_dim = int(obs.shape[0])
+        obs = np.asarray(obs, dtype=np.float32)
+        if obs.ndim == 1:
+            obs = obs[None, :]
+        num_envs = int(obs.shape[0])
+        obs_dim = int(obs.shape[-1])
         action_dim = int(env.action_dim)
         model = ActorCritic(
             obs_dim=obs_dim,
@@ -178,31 +232,31 @@ def main():
         ).to(torch_device)
         optimizer = optim.Adam(model.parameters(), lr=ppo_cfg.lr)
 
-        episode_return = 0.0
-        episode_length = 0
+        episode_return = np.zeros((num_envs,), dtype=np.float32)
+        episode_length = np.zeros((num_envs,), dtype=np.int32)
         global_step = 0
         history = []
         train_stats_history = []
 
         for update in range(1, ppo_cfg.total_updates + 1):
-            obs_buf = np.zeros((ppo_cfg.rollout_steps, obs_dim), dtype=np.float32)
-            action_buf = np.zeros((ppo_cfg.rollout_steps, action_dim), dtype=np.float32)
-            logp_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
-            reward_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
-            done_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
-            value_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
-            contact_vec_target_buf = np.zeros((ppo_cfg.rollout_steps, 6), dtype=np.float32)
-            teacher_action_buf = np.zeros((ppo_cfg.rollout_steps, action_dim), dtype=np.float32)
-            teacher_qpos_residual_buf = np.zeros((ppo_cfg.rollout_steps, 20), dtype=np.float32)
-            progress_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
-            stable_contact_buf = np.zeros((ppo_cfg.rollout_steps,), dtype=np.float32)
+            obs_buf = np.zeros((ppo_cfg.rollout_steps, num_envs, obs_dim), dtype=np.float32)
+            action_buf = np.zeros((ppo_cfg.rollout_steps, num_envs, action_dim), dtype=np.float32)
+            logp_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
+            reward_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
+            done_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
+            value_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
+            contact_vec_target_buf = np.zeros((ppo_cfg.rollout_steps, num_envs, 6), dtype=np.float32)
+            teacher_action_buf = np.zeros((ppo_cfg.rollout_steps, num_envs, action_dim), dtype=np.float32)
+            teacher_qpos_residual_buf = np.zeros((ppo_cfg.rollout_steps, num_envs, 20), dtype=np.float32)
+            progress_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
+            stable_contact_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
 
             for step in range(ppo_cfg.rollout_steps):
-                global_step += 1
-                obs_tensor = torch.tensor(obs, dtype=torch.float32, device=torch_device).unsqueeze(0)
+                global_step += num_envs
+                obs_tensor = torch.tensor(obs, dtype=torch.float32, device=torch_device)
                 with torch.no_grad():
                     action_tensor, logp_tensor, value_tensor, contact_logit_tensor = model.act(obs_tensor)
-                sampled_action = action_tensor.squeeze(0).cpu().numpy().astype(np.float32)
+                sampled_action = action_tensor.cpu().numpy().astype(np.float32)
                 teacher_action = env.get_teacher_action(step_index=step)
                 action = (
                     (1.0 - ppo_cfg.teacher_forcing_coef) * sampled_action
@@ -212,39 +266,47 @@ def main():
 
                 obs_buf[step] = obs
                 action_buf[step] = action
-                logp_buf[step] = float(logp_tensor.item())
-                reward_buf[step] = float(reward)
-                done_buf[step] = float(done)
-                value_buf[step] = float(value_tensor.item())
+                logp_buf[step] = np.asarray(logp_tensor.cpu().numpy(), dtype=np.float32)
+                reward_buf[step] = np.asarray(reward, dtype=np.float32)
+                done_buf[step] = np.asarray(done, dtype=np.float32)
+                value_buf[step] = np.asarray(value_tensor.cpu().numpy(), dtype=np.float32)
                 contact_vec_target_buf[step] = np.asarray(info["contact_target"], dtype=np.float32)
                 teacher_action_buf[step] = teacher_action
                 teacher_qpos_residual_buf[step] = np.asarray(info["teacher_qpos_residual"], dtype=np.float32)
-                progress_buf[step] = float(info["progress"])
-                stable_contact_buf[step] = float(info["surface_contact_stable"])
+                progress_buf[step] = np.asarray(info["progress"], dtype=np.float32)
+                stable_contact_buf[step] = np.asarray(info["surface_contact_stable"], dtype=np.float32)
 
                 obs = next_obs
-                episode_return += float(reward)
+                episode_return += np.asarray(reward, dtype=np.float32)
                 episode_length += 1
 
-                if done:
-                    curriculum_info = env.update_curriculum(bool(info["success"]))
-                    history.append(
-                        {
-                            "global_step": global_step,
-                            "episode_return": float(episode_return),
-                            "episode_length": int(episode_length),
-                            "progress": float(info["progress"]),
-                            "success": bool(info["success"]),
-                            "curriculum_phase": curriculum_info["curriculum_phase"],
-                            "curriculum_level": curriculum_info["curriculum_level"],
-                        }
-                    )
+                done_arr = np.asarray(done, dtype=bool)
+                success_arr = np.asarray(info["success"], dtype=bool)
+                progress_arr = np.asarray(info["progress"], dtype=np.float32)
+                if np.any(done_arr):
+                    curriculum_info = env.update_curriculum(bool(np.mean(success_arr.astype(np.float32)) > 0.5))
+                    for env_i in np.where(done_arr)[0]:
+                        history.append(
+                            {
+                                "global_step": global_step,
+                                "env_i": int(env_i),
+                                "episode_return": float(episode_return[env_i]),
+                                "episode_length": int(episode_length[env_i]),
+                                "progress": float(progress_arr[env_i]),
+                                "success": bool(success_arr[env_i]),
+                                "curriculum_phase": curriculum_info["curriculum_phase"],
+                                "curriculum_level": curriculum_info["curriculum_level"],
+                            }
+                        )
                     obs, reset_info = env.reset()
-                    episode_return = 0.0
-                    episode_length = 0
+                    obs = np.asarray(obs, dtype=np.float32)
+                    if obs.ndim == 1:
+                        obs = obs[None, :]
+                    episode_return[done_arr] = 0.0
+                    episode_length[done_arr] = 0
 
             with torch.no_grad():
-                next_value = float(model.forward(torch.tensor(obs, dtype=torch.float32, device=torch_device).unsqueeze(0))[2].item())
+                next_value = model.forward(torch.tensor(obs, dtype=torch.float32, device=torch_device))[2].cpu().numpy().astype(np.float32)
 
             advantages, returns = compute_gae(
                 reward_buf,
@@ -256,17 +318,27 @@ def main():
             )
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-            obs_tensor = torch.tensor(obs_buf, dtype=torch.float32, device=torch_device)
-            action_tensor = torch.tensor(action_buf, dtype=torch.float32, device=torch_device)
-            old_logp_tensor = torch.tensor(logp_buf, dtype=torch.float32, device=torch_device)
-            adv_tensor = torch.tensor(advantages, dtype=torch.float32, device=torch_device)
-            ret_tensor = torch.tensor(returns, dtype=torch.float32, device=torch_device)
-            contact_vec_target_tensor = torch.tensor(contact_vec_target_buf, dtype=torch.float32, device=torch_device)
-            teacher_action_tensor = torch.tensor(teacher_action_buf, dtype=torch.float32, device=torch_device)
-            teacher_qpos_residual_tensor = torch.tensor(teacher_qpos_residual_buf, dtype=torch.float32, device=torch_device)
-            old_value_tensor = torch.tensor(value_buf, dtype=torch.float32, device=torch_device)
+            flat_obs = obs_buf.reshape(-1, obs_dim)
+            flat_actions = action_buf.reshape(-1, action_dim)
+            flat_logp = logp_buf.reshape(-1)
+            flat_adv = advantages.reshape(-1)
+            flat_returns = returns.reshape(-1)
+            flat_contact = contact_vec_target_buf.reshape(-1, 6)
+            flat_teacher_action = teacher_action_buf.reshape(-1, action_dim)
+            flat_teacher_qpos = teacher_qpos_residual_buf.reshape(-1, 20)
+            flat_values = value_buf.reshape(-1)
 
-            batch_size = ppo_cfg.rollout_steps
+            obs_tensor = torch.tensor(flat_obs, dtype=torch.float32, device=torch_device)
+            action_tensor = torch.tensor(flat_actions, dtype=torch.float32, device=torch_device)
+            old_logp_tensor = torch.tensor(flat_logp, dtype=torch.float32, device=torch_device)
+            adv_tensor = torch.tensor(flat_adv, dtype=torch.float32, device=torch_device)
+            ret_tensor = torch.tensor(flat_returns, dtype=torch.float32, device=torch_device)
+            contact_vec_target_tensor = torch.tensor(flat_contact, dtype=torch.float32, device=torch_device)
+            teacher_action_tensor = torch.tensor(flat_teacher_action, dtype=torch.float32, device=torch_device)
+            teacher_qpos_residual_tensor = torch.tensor(flat_teacher_qpos, dtype=torch.float32, device=torch_device)
+            old_value_tensor = torch.tensor(flat_values, dtype=torch.float32, device=torch_device)
+
+            batch_size = ppo_cfg.rollout_steps * num_envs
             inds = np.arange(batch_size)
             last_stats = {}
             for _ in range(ppo_cfg.epochs):
@@ -328,13 +400,24 @@ def main():
             success_rate = float(np.mean([float(item["success"]) for item in recent])) if recent else 0.0
             rollout_contact_rate = float(np.mean(stable_contact_buf))
             rollout_progress = float(np.mean(progress_buf))
+            tf_recent = history[-int(max(1, ppo_cfg.teacher_forcing_window)) :]
+            tf_recent_success = float(np.mean([float(item["success"]) for item in tf_recent])) if tf_recent else 0.0
+            if tf_recent and tf_recent_success >= float(ppo_cfg.teacher_forcing_success_threshold):
+                ppo_cfg.teacher_forcing_coef = max(
+                    float(ppo_cfg.teacher_forcing_min),
+                    float(ppo_cfg.teacher_forcing_coef) * float(ppo_cfg.teacher_forcing_decay),
+                )
+                ppo_cfg.bc_coef = max(
+                    float(ppo_cfg.bc_coef_min),
+                    float(ppo_cfg.bc_coef) * float(ppo_cfg.bc_coef_decay),
+                )
             print(
                 f"update={update:04d} avg_return={avg_return:.3f} "
                 f"avg_progress={avg_progress:.4f} success_rate={success_rate:.2f} "
                 f"rollout_contact={rollout_contact_rate:.2f} rollout_prog={rollout_progress:.4f} "
                 f"bc={last_stats.get('bc_loss', 0.0):.4f} contact_aux={last_stats.get('contact_aux_loss', 0.0):.4f} "
                 f"qpos_res={last_stats.get('teacher_qpos_residual_l1', 0.0):.4f} "
-                f"tf={ppo_cfg.teacher_forcing_coef:.2f} "
+                f"tf={ppo_cfg.teacher_forcing_coef:.2f} bc_coef={ppo_cfg.bc_coef:.3f} tf_recent={tf_recent_success:.2f} "
                 f"phase={env.get_curriculum_phase()}"
             )
             train_stats_history.append(
@@ -345,11 +428,17 @@ def main():
                     "success_rate": float(success_rate),
                     "rollout_contact_rate": float(rollout_contact_rate),
                     "rollout_progress": float(rollout_progress),
+                    "bc_coef": float(ppo_cfg.bc_coef),
+                    "bc_recent_success": float(tf_recent_success),
+                    "teacher_forcing_coef": float(ppo_cfg.teacher_forcing_coef),
+                    "teacher_forcing_recent_success": float(tf_recent_success),
                     "curriculum_phase": env.get_curriculum_phase(),
                     "curriculum_level": int(env.curriculum_level),
                     **last_stats,
                 }
             )
+            if wandb_run is not None:
+                wandb.log(train_stats_history[-1], step=update)
 
             if update % ppo_cfg.save_every == 0 or update == ppo_cfg.total_updates:
                 checkpoint_path = os.path.join(args.save_dir, f"ppo_update_{update:04d}.pt")
@@ -384,6 +473,8 @@ def main():
                 handle,
             )
     finally:
+        if wandb_run is not None:
+            wandb.finish()
         env.close()
 
 

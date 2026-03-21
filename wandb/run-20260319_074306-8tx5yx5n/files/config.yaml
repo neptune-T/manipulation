@@ -1,0 +1,181 @@
+_wandb:
+    value:
+        cli_version: 0.24.1
+        e:
+            w7tiq0stdu90gqmhc5smouf80oamco44:
+                args:
+                    - --headless
+                    - --num-envs
+                    - "4"
+                    - --teacher-forcing-coef
+                    - "0.4"
+                    - --teacher-forcing-min
+                    - "0.05"
+                    - --teacher-forcing-decay
+                    - "0.9"
+                    - --teacher-forcing-success-threshold
+                    - "0.8"
+                    - --teacher-forcing-window
+                    - "20"
+                    - --wandb
+                    - --wandb-project
+                    - gapartnet-hoi
+                    - --wandb-name
+                    - door11712_batch2
+                codePath: single_door_ppo.py
+                codePathLocal: single_door_ppo.py
+                cpu_count: 14
+                cpu_count_logical: 20
+                cudaVersion: "13.0"
+                disk:
+                    /:
+                        total: "982820896768"
+                        used: "863938699264"
+                email: 2980976495@qq.com
+                executable: /home/plote/miniconda3/envs/isaacgym/bin/python
+                git:
+                    commit: 1b23797c0f043462dec25ebfbe00bbd89dd03bce
+                    remote: https://github.com/neptune-T/hoi.git
+                gpu: NVIDIA GeForce RTX 3070 Laptop GPU
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 5120
+                      memoryTotal: "8589934592"
+                      name: NVIDIA GeForce RTX 3070 Laptop GPU
+                      uuid: GPU-c59c3067-7297-b6e0-59d8-fca4ce36080c
+                host: plote
+                memory:
+                    total: "16547221504"
+                os: Linux-6.8.0-101-generic-x86_64-with-glibc2.17
+                program: single_door_ppo.py
+                python: CPython 3.8.20
+                root: /home/plote/hoi/GAPartNet/manipulation
+                startedAt: "2026-03-18T23:43:06.576292Z"
+                writerId: w7tiq0stdu90gqmhc5smouf80oamco44
+        m: []
+        python_version: 3.8.20
+        t:
+            "1":
+                - 1
+                - 5
+                - 53
+            "2":
+                - 1
+                - 5
+                - 53
+            "3":
+                - 2
+                - 13
+                - 16
+                - 61
+            "4": 3.8.20
+            "5": 0.24.1
+            "12": 0.24.1
+            "13": linux-x86_64
+asset_dir:
+    value: assets/gapartnet_example/11712
+device:
+    value: cuda
+env_cfg:
+    value:
+        action_repeat: 2
+        asset_dir: assets/gapartnet_example/11712
+        config_path: config.yaml
+        contact_target_points: 6
+        curriculum_enabled: false
+        curriculum_levels:
+            - grasp
+            - actuate
+            - open
+        curriculum_success_threshold: 0.8
+        curriculum_window: 20
+        device: cuda
+        door_index: 0
+        door_plane_buffer: 0.003
+        grasp_settle_steps: 6
+        grasp_settle_synergy_scale: 0.65
+        headless: true
+        max_episode_steps: 120
+        max_open_amount: 1.2
+        max_safe_penetration: -0.0015
+        min_contact_points: 30
+        num_envs: 4
+        palm_safe_buffer: 0.005
+        pinch_search_depth_step: 0.0015
+        pinch_search_enabled: true
+        pinch_search_lateral_step: 0.008
+        pinch_search_lateral_trials: 5
+        pinch_search_roll_deg: 12
+        pinch_search_yaw_deg: 18
+        pos_action_scale: 0.015
+        pregrasp_offset: 0.06
+        reset_phase: grasp
+        reset_pose_noise: 0.002
+        reset_rot_noise: 0.02
+        reward_config:
+            action_l2_weight: 0.01
+            action_smooth_weight: 0.02
+            align_weight: 0.1
+            contact_target_points: 6
+            contact_weight: 0.8
+            detach_penalty_weight: 1.5
+            fingertip_penetration_allowance: 0.0035
+            force_closure_gate_threshold: 0.3
+            force_closure_weight: 1.25
+            hold_weight: 0.8
+            opposition_weight: 1.2
+            outside_grasp_bonus_gate: 0.45
+            outside_grasp_penalty: 4
+            palm_penetration_penalty: 10
+            penetration_progress_penalty: 8
+            pinch_gate_threshold: 0.35
+            progress_gate_threshold: 0.55
+            progress_weight: 8
+            reach_scale: 4
+            reach_weight: 0.25
+            sdf_contact_weight: 0.8
+            sdf_far_margin: 0.015
+            sdf_penetration_weight: 1.2
+            sdf_target_margin: 0.002
+            success_bonus: 10
+            success_progress: 0.39269908169872414
+            tangent_scale: 0.5
+            tangent_weight: 0.75
+        rot_action_scale: 0.06
+        save_root: output/single_door_rl
+        settle_steps: 6
+        severe_penetration_termination_penalty: 25
+        severe_penetration_threshold: -0.008
+        stabilize_grasp: true
+        stabilize_on_reset: true
+        synergy_action_scale: 0.35
+        task_index: 0
+        trajectory_steps: 100
+        use_demo_base_pose: true
+        use_optimized_grasp: true
+        wrist_rotation_lock: 0.85
+ppo_cfg:
+    value:
+        action_std_init: 0.35
+        bc_coef: 0.1
+        clip_ratio: 0.2
+        contact_aux_coef: 0.2
+        entropy_coef: 0.001
+        epochs: 4
+        gae_lambda: 0.95
+        gamma: 0.99
+        hidden_dim: 256
+        lr: 0.0003
+        max_grad_norm: 1
+        minibatch_size: 128
+        rollout_steps: 256
+        save_every: 20
+        teacher_forcing_coef: 0.4
+        teacher_forcing_decay: 0.9
+        teacher_forcing_min: 0.05
+        teacher_forcing_success_threshold: 0.8
+        teacher_forcing_window: 20
+        total_updates: 500
+        value_clip: 0.2
+        value_coef: 0.5

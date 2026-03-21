@@ -1,0 +1,60 @@
+{
+  "os":  "Linux-6.8.0-101-generic-x86_64-with-glibc2.17",
+  "python":  "CPython 3.8.20",
+  "startedAt":  "2026-03-18T15:01:54.591485Z",
+  "args":  [
+    "--headless",
+    "--num-envs",
+    "4",
+    "--teacher-forcing-coef",
+    "0.4",
+    "--teacher-forcing-min",
+    "0.05",
+    "--teacher-forcing-decay",
+    "0.9",
+    "--teacher-forcing-success-threshold",
+    "0.8",
+    "--teacher-forcing-window",
+    "20",
+    "--wandb",
+    "--wandb-project",
+    "gapartnet-hoi",
+    "--wandb-name",
+    "door11712_batch2"
+  ],
+  "program":  "single_door_ppo.py",
+  "codePath":  "single_door_ppo.py",
+  "codePathLocal":  "single_door_ppo.py",
+  "git":  {
+    "remote":  "https://github.com/neptune-T/hoi.git",
+    "commit":  "1b23797c0f043462dec25ebfbe00bbd89dd03bce"
+  },
+  "email":  "2980976495@qq.com",
+  "root":  "/home/plote/hoi/GAPartNet/manipulation",
+  "host":  "plote",
+  "executable":  "/home/plote/miniconda3/envs/isaacgym/bin/python",
+  "cpu_count":  14,
+  "cpu_count_logical":  20,
+  "gpu":  "NVIDIA GeForce RTX 3070 Laptop GPU",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "982820896768",
+      "used":  "876134195200"
+    }
+  },
+  "memory":  {
+    "total":  "16547225600"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA GeForce RTX 3070 Laptop GPU",
+      "memoryTotal":  "8589934592",
+      "cudaCores":  5120,
+      "architecture":  "Ampere",
+      "uuid":  "GPU-c59c3067-7297-b6e0-59d8-fca4ce36080c"
+    }
+  ],
+  "cudaVersion":  "13.0",
+  "writerId":  "dab30xt2umzq2ea6dyizo169yp8kr76b"
+}

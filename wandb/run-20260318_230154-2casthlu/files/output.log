@@ -1,0 +1,16 @@
+update=0001 avg_return=45.317 avg_progress=0.4051 success_rate=1.00 rollout_contact=0.37 rollout_prog=0.2615 bc=0.4473 contact_aux=0.5552 qpos_res=0.1571 tf=0.36 tf_recent=1.00 phase=grasp
+update=0002 avg_return=38.087 avg_progress=0.4011 success_rate=1.00 rollout_contact=0.48 rollout_prog=0.2654 bc=0.9729 contact_aux=0.4320 qpos_res=0.1571 tf=0.32 tf_recent=1.00 phase=grasp
+update=0003 avg_return=98.852 avg_progress=0.4006 success_rate=1.00 rollout_contact=0.54 rollout_prog=0.2566 bc=1.0743 contact_aux=0.3804 qpos_res=0.1571 tf=0.29 tf_recent=1.00 phase=grasp
+update=0004 avg_return=147.630 avg_progress=0.3968 success_rate=1.00 rollout_contact=0.60 rollout_prog=0.2632 bc=1.1850 contact_aux=0.3609 qpos_res=0.1571 tf=0.26 tf_recent=1.00 phase=grasp
+update=0005 avg_return=75.786 avg_progress=0.3977 success_rate=1.00 rollout_contact=0.60 rollout_prog=0.2619 bc=1.0827 contact_aux=0.3573 qpos_res=0.1571 tf=0.24 tf_recent=1.00 phase=grasp
+update=0006 avg_return=98.103 avg_progress=0.4013 success_rate=1.00 rollout_contact=0.67 rollout_prog=0.2554 bc=1.1209 contact_aux=0.3553 qpos_res=0.1571 tf=0.21 tf_recent=1.00 phase=grasp
+update=0007 avg_return=98.286 avg_progress=0.4015 success_rate=1.00 rollout_contact=0.72 rollout_prog=0.2609 bc=1.3642 contact_aux=0.3514 qpos_res=0.1571 tf=0.19 tf_recent=1.00 phase=grasp
+update=0008 avg_return=180.023 avg_progress=0.3993 success_rate=1.00 rollout_contact=0.86 rollout_prog=0.2606 bc=2.1447 contact_aux=0.3419 qpos_res=0.1571 tf=0.17 tf_recent=1.00 phase=grasp
+update=0009 avg_return=258.509 avg_progress=0.4009 success_rate=1.00 rollout_contact=0.80 rollout_prog=0.2614 bc=1.7926 contact_aux=0.3432 qpos_res=0.1571 tf=0.15 tf_recent=1.00 phase=grasp
+update=0010 avg_return=242.747 avg_progress=0.4001 success_rate=1.00 rollout_contact=0.73 rollout_prog=0.2493 bc=2.0380 contact_aux=0.3388 qpos_res=0.1571 tf=0.14 tf_recent=1.00 phase=grasp
+update=0011 avg_return=344.534 avg_progress=0.4050 success_rate=1.00 rollout_contact=0.76 rollout_prog=0.2603 bc=2.1778 contact_aux=0.3371 qpos_res=0.1571 tf=0.13 tf_recent=1.00 phase=grasp
+update=0012 avg_return=125.868 avg_progress=0.3999 success_rate=1.00 rollout_contact=0.77 rollout_prog=0.2665 bc=2.0179 contact_aux=0.3350 qpos_res=0.1571 tf=0.11 tf_recent=1.00 phase=grasp
+update=0013 avg_return=99.525 avg_progress=0.3973 success_rate=1.00 rollout_contact=0.67 rollout_prog=0.2763 bc=1.9815 contact_aux=0.3344 qpos_res=0.1571 tf=0.10 tf_recent=1.00 phase=grasp
+update=0014 avg_return=174.798 avg_progress=0.4005 success_rate=1.00 rollout_contact=0.61 rollout_prog=0.2771 bc=2.5689 contact_aux=0.3324 qpos_res=0.1571 tf=0.09 tf_recent=1.00 phase=grasp
+update=0015 avg_return=286.546 avg_progress=0.4078 success_rate=1.00 rollout_contact=0.66 rollout_prog=0.2710 bc=2.3739 contact_aux=0.3320 qpos_res=0.1571 tf=0.08 tf_recent=1.00 phase=grasp
+update=0016 avg_return=88.447 avg_progress=0.4026 success_rate=1.00 rollout_contact=0.48 rollout_prog=0.2697 bc=3.0214 contact_aux=0.3314 qpos_res=0.1571 tf=0.07 tf_recent=1.00 phase=grasp

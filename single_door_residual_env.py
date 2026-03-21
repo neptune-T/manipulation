@@ -287,6 +287,8 @@ class SingleDoorResidualConfig:
     max_safe_penetration: float = -0.0015
     door_plane_buffer: float = 0.003
     palm_safe_buffer: float = 0.005
+    severe_penetration_threshold: float = -0.008
+    severe_penetration_termination_penalty: float = 25.0
 
 
 class SingleDoorResidualEnv:
@@ -314,15 +316,15 @@ class SingleDoorResidualEnv:
         self.anchor_qpos = self.closed_qpos.copy()
         self.demo_traj = np.zeros((1, 7), dtype=np.float32)
         self.demo_info: Dict[str, Any] = {}
-        self.last_pose_target = np.zeros(7, dtype=np.float32)
-        self.last_qpos_target = self.closed_qpos.copy()
-        self.prev_state = None
-        self.prev_action = np.zeros(self.action_dim, dtype=np.float32)
-        self.step_count = 0
+        self.last_pose_target = np.zeros((self.config.num_envs, 7), dtype=np.float32)
+        self.last_qpos_target = np.tile(self.closed_qpos[None, :], (self.config.num_envs, 1)).astype(np.float32)
+        self.prev_state = [None for _ in range(self.config.num_envs)]
+        self.prev_action = np.zeros((self.config.num_envs, self.action_dim), dtype=np.float32)
+        self.step_count = np.zeros((self.config.num_envs,), dtype=np.int32)
         self.observation_dim = None
         self.curriculum_level = 0
         self.curriculum_history = []
-        self.grasp_settle_counter = 0
+        self.grasp_settle_counter = np.zeros((self.config.num_envs,), dtype=np.int32)
         self._prepare_teacher()
 
     def _resolve_asset_paths(self, asset_dir: str) -> Tuple[str, str, str]:
@@ -822,9 +824,9 @@ class SingleDoorResidualEnv:
             return self.phase_qpos_targets.get(self.get_curriculum_phase(), self.anchor_qpos).copy()
         return self.last_qpos_target.copy()
 
-    def get_demo_base(self, step_index: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
+    def get_demo_base(self, step_index: Optional[int] = None, env_i: int = 0) -> Tuple[np.ndarray, np.ndarray]:
         if step_index is None:
-            step_index = self.step_count
+            step_index = int(self.step_count[env_i])
         pose = self.demo_traj[int(np.clip(step_index, 0, len(self.demo_traj) - 1))].copy()
         qpos = self.phase_qpos_targets.get(self.get_curriculum_phase(), self.anchor_qpos).copy()
         return pose.astype(np.float32), qpos.astype(np.float32)
@@ -880,30 +882,35 @@ class SingleDoorResidualEnv:
             return self.demo_traj[index].copy(), self.phase_qpos_targets["actuate"].copy()
         return self.anchor_pose.copy(), self.phase_qpos_targets["open"].copy()
 
-    def action_to_target(self, action: Sequence[float], step_index: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
+    def action_to_target(self, action: Sequence[float], step_index: Optional[int] = None, env_i: int = 0) -> Tuple[np.ndarray, np.ndarray]:
         action_arr = np.asarray(action, dtype=np.float32).reshape(self.action_dim)
         if self.config.use_demo_base_pose:
-            base_pose, base_qpos = self.get_demo_base(step_index=step_index)
+            base_pose, base_qpos = self.get_demo_base(step_index=step_index, env_i=env_i)
         else:
-            base_pose = self.last_pose_target.copy()
-            base_qpos = self.last_qpos_target.copy()
+            base_pose = self.last_pose_target[env_i].copy()
+            base_qpos = self.last_qpos_target[env_i].copy()
         target_pose = self._apply_pose_action(base_pose, action_arr[:6])
         target_qpos = self._apply_synergy_action(base_qpos, action_arr[6:])
         return target_pose.astype(np.float32), target_qpos.astype(np.float32)
 
-    def get_teacher_action(self, step_index: Optional[int] = None) -> np.ndarray:
+    def get_teacher_action(self, step_index: Optional[int] = None, env_i: Optional[int] = None) -> np.ndarray:
+        if env_i is None:
+            if self.config.num_envs == 1:
+                env_i = 0
+            else:
+                return np.stack([self.get_teacher_action(step_index=step_index, env_i=i) for i in range(self.config.num_envs)], axis=0).astype(np.float32)
         if step_index is None:
-            step_index = self.step_count
+            step_index = int(self.step_count[env_i])
         if not self.config.use_demo_base_pose:
             return np.zeros(self.action_dim, dtype=np.float32)
-        base_pose, base_qpos = self.get_demo_base(step_index=step_index)
+        base_pose, base_qpos = self.get_demo_base(step_index=step_index, env_i=env_i)
         next_index = int(np.clip(step_index + 1, 0, len(self.demo_traj) - 1))
         next_pose = self.demo_traj[next_index].copy()
         teacher_phase = self.get_curriculum_phase()
-        if teacher_phase == "grasp":
+        if teacher_phase == "grasp" and self.prev_state[env_i] is not None:
             pull_pose = next_pose.copy()
-            pull_pose[:3] += 0.35 * float(self.config.pos_action_scale) * self.prev_state.open_tangent_world
-            pull_pose[:3] -= 0.20 * float(self.config.pos_action_scale) * self.prev_state.handle_out_world
+            pull_pose[:3] += 0.35 * float(self.config.pos_action_scale) * self.prev_state[env_i].open_tangent_world
+            pull_pose[:3] -= 0.20 * float(self.config.pos_action_scale) * self.prev_state[env_i].handle_out_world
             next_pose = pull_pose
         pos_residual = (next_pose[:3] - base_pose[:3]) / max(self.config.pos_action_scale, 1e-6)
         delta_rot = R.from_quat(next_pose[3:7]) * R.from_quat(base_pose[3:7]).inv()
@@ -926,11 +933,18 @@ class SingleDoorResidualEnv:
         )
         return np.clip(teacher_action, -1.0, 1.0).astype(np.float32)
 
-    def get_teacher_targets(self, step_index: Optional[int] = None) -> Dict[str, Any]:
-        teacher_action = self.get_teacher_action(step_index=step_index)
-        teacher_target_pose, teacher_target_qpos = self.action_to_target(teacher_action, step_index=step_index)
+    def get_teacher_targets(self, step_index: Optional[int] = None, env_i: Optional[int] = None) -> Dict[str, Any]:
+        if env_i is None:
+            if self.config.num_envs == 1:
+                env_i = 0
+            else:
+                stacked = [self.get_teacher_targets(step_index=step_index, env_i=i) for i in range(self.config.num_envs)]
+                keys = stacked[0].keys()
+                return {k: np.stack([item[k] for item in stacked], axis=0) if isinstance(stacked[0][k], np.ndarray) else [item[k] for item in stacked] for k in keys}
+        teacher_action = self.get_teacher_action(step_index=step_index, env_i=env_i)
+        teacher_target_pose, teacher_target_qpos = self.action_to_target(teacher_action, step_index=step_index, env_i=env_i)
         teacher_phase = self.get_curriculum_phase()
-        _, teacher_base_qpos = self.get_demo_base(step_index=step_index)
+        _, teacher_base_qpos = self.get_demo_base(step_index=step_index, env_i=env_i)
         teacher_qpos_residual = (
             (teacher_target_qpos - teacher_base_qpos) / max(self.config.synergy_action_scale, 1e-6)
         ).astype(np.float32)
@@ -1011,25 +1025,33 @@ class SingleDoorResidualEnv:
         if reset_phase != "approach" and self.config.stabilize_on_reset:
             hand_pose, reset_stable, reset_grasp_info = self._stabilize_reset_grasp(hand_pose=hand_pose, hand_qpos=hand_qpos)
             self._set_state(hand_pose=hand_pose, hand_qpos=hand_qpos, obj_qpos=None, settle_steps=max(self.config.settle_steps, 2))
-        self.last_pose_target = hand_pose.copy()
-        self.last_qpos_target = hand_qpos.copy()
-        self.prev_action = self.zero_action()
-        self.step_count = 0
-        self.grasp_settle_counter = int(max(0, self.config.grasp_settle_steps if reset_phase != "approach" else 0))
-        self.prev_state = extract_single_door_runtime_state(
-            self.gym,
-            self.task_spec,
-            env_i=0,
-            surface_contact_thresh=0.015,
-            min_contact_points=self.config.min_contact_points,
-            contact_target_points=self.config.contact_target_points,
-        )
-        obs = build_single_door_observation(
-            self.prev_state,
-            prev_action=self.prev_action,
-            contact_target_points=self.config.contact_target_points,
-        )
-        self.observation_dim = int(obs.shape[0])
+        obs_list = []
+        state_list = []
+        for env_i in range(self.config.num_envs):
+            self.last_pose_target[env_i] = hand_pose.copy()
+            self.last_qpos_target[env_i] = hand_qpos.copy()
+            self.prev_action[env_i] = self.zero_action()
+            self.step_count[env_i] = 0
+            self.grasp_settle_counter[env_i] = int(max(0, self.config.grasp_settle_steps if reset_phase != "approach" else 0))
+            state = extract_single_door_runtime_state(
+                self.gym,
+                self.task_spec,
+                env_i=env_i,
+                surface_contact_thresh=0.015,
+                min_contact_points=self.config.min_contact_points,
+                contact_target_points=self.config.contact_target_points,
+            )
+            self.prev_state[env_i] = state
+            state_list.append(state)
+            obs_list.append(
+                build_single_door_observation(
+                    state,
+                    prev_action=self.prev_action[env_i],
+                    contact_target_points=self.config.contact_target_points,
+                )
+            )
+        obs = np.stack(obs_list, axis=0).astype(np.float32)
+        self.observation_dim = int(obs.shape[-1])
         reset_teacher_targets = self.get_teacher_targets(step_index=0)
         info = {
             "reset_phase": reset_phase,
@@ -1037,129 +1059,154 @@ class SingleDoorResidualEnv:
             "curriculum_level": int(self.curriculum_level),
             "task_spec": self.task_spec.to_dict(),
             "demo_info": self.demo_info,
-            "progress": float(self.prev_state.progress),
-            "surface_contact_count": int(self.prev_state.surface_contact_count),
-            "surface_contact_stable": bool(self.prev_state.surface_contact_stable),
-            "door_plane_violation": float(self._door_plane_violation(self.prev_state)),
-            "contact_features": _to_jsonable(build_contact_feature_vector(self.prev_state.surface_contact_link_counts)),
+            "progress": np.asarray([state.progress for state in state_list], dtype=np.float32),
+            "surface_contact_count": np.asarray([state.surface_contact_count for state in state_list], dtype=np.int32),
+            "surface_contact_stable": np.asarray([state.surface_contact_stable for state in state_list], dtype=np.bool_),
+            "door_plane_violation": np.asarray([self._door_plane_violation(state) for state in state_list], dtype=np.float32),
+            "contact_features": np.stack([build_contact_feature_vector(state.surface_contact_link_counts) for state in state_list], axis=0).astype(np.float32),
             "contact_target": _to_jsonable(get_phase_contact_target(self.get_curriculum_phase())),
             "contact_link_order": list(CONTACT_LINK_ORDER),
             "reset_grasp_stable": bool(reset_stable),
             "reset_grasp_info": _to_jsonable(reset_grasp_info),
-            "grasp_settle_counter": int(self.grasp_settle_counter),
+            "grasp_settle_counter": self.grasp_settle_counter.astype(np.int32),
             "teacher_qpos_residual": _to_jsonable(reset_teacher_targets["teacher_qpos_residual"]),
-            "pinch_debug": {
-                "thumb3": int(self.prev_state.surface_contact_link_counts.get("thumb3", 0)),
-                "index3": int(self.prev_state.surface_contact_link_counts.get("index3", 0)),
-                "middle3": int(self.prev_state.surface_contact_link_counts.get("middle3", 0)),
-                "ring3": int(self.prev_state.surface_contact_link_counts.get("ring3", 0)),
-                "pinky3": int(self.prev_state.surface_contact_link_counts.get("pinky3", 0)),
-            },
+            "pinch_debug": [
+                {
+                    "thumb3": int(state.surface_contact_link_counts.get("thumb3", 0)),
+                    "index3": int(state.surface_contact_link_counts.get("index3", 0)),
+                    "middle3": int(state.surface_contact_link_counts.get("middle3", 0)),
+                    "ring3": int(state.surface_contact_link_counts.get("ring3", 0)),
+                    "pinky3": int(state.surface_contact_link_counts.get("pinky3", 0)),
+                }
+                for state in state_list
+            ],
             "observation_dim": int(self.observation_dim),
         }
-        return obs.astype(np.float32), info
+        return obs if self.config.num_envs > 1 else obs[0], info
 
     def step(self, action: Sequence[float]) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
-        action_arr = np.asarray(action, dtype=np.float32).reshape(self.action_dim)
-        teacher_targets = self.get_teacher_targets(step_index=self.step_count)
-        base_pose = self._base_pose_for_step()
-        base_qpos = self._base_qpos_for_step()
-        in_grasp_settle = bool(self.grasp_settle_counter > 0)
-        if in_grasp_settle:
-            target_pose, target_qpos = self._apply_grasp_settle(base_pose, base_qpos, action_arr)
-            self.grasp_settle_counter = max(0, self.grasp_settle_counter - 1)
-        else:
-            target_pose = self._apply_pose_action(base_pose, action_arr[:6])
-            target_qpos = self._apply_synergy_action(base_qpos, action_arr[6:])
+        action_arr = np.asarray(action, dtype=np.float32)
+        if action_arr.ndim == 1:
+            action_arr = np.repeat(action_arr[None, :], self.config.num_envs, axis=0)
+        teacher_targets = self.get_teacher_targets()
+        obs_list, reward_list, done_list, state_list = [], [], [], []
+        target_pose_list, target_qpos_list, reward_terms_list = [], [], []
+        settle_active_list, door_plane_violation_list, pinch_debug_list = [], [], []
 
-        if self.prev_state is not None:
-            target_pose = self._apply_door_plane_buffer(target_pose, self.prev_state)
+        for env_i in range(self.config.num_envs):
+            env_action = action_arr[env_i].reshape(self.action_dim)
+            base_pose = self._base_pose_for_step() if self.config.num_envs == 1 else self.last_pose_target[env_i].copy()
+            if self.config.use_demo_base_pose:
+                base_pose, base_qpos = self.get_demo_base(step_index=int(self.step_count[env_i]), env_i=env_i)
+            else:
+                base_qpos = self.last_qpos_target[env_i].copy()
+            in_grasp_settle = bool(self.grasp_settle_counter[env_i] > 0)
+            if in_grasp_settle:
+                target_pose, target_qpos = self._apply_grasp_settle(base_pose, base_qpos, env_action)
+                self.grasp_settle_counter[env_i] = max(0, int(self.grasp_settle_counter[env_i]) - 1)
+            else:
+                target_pose = self._apply_pose_action(base_pose, env_action[:6])
+                target_qpos = self._apply_synergy_action(base_qpos, env_action[6:])
 
-        self._apply_hand_targets(hand_pose=target_pose, hand_qpos=target_qpos, settle_steps=max(1, self.config.action_repeat))
+            if self.prev_state[env_i] is not None:
+                target_pose = self._apply_door_plane_buffer(target_pose, self.prev_state[env_i])
 
-        state = extract_single_door_runtime_state(
-            self.gym,
-            self.task_spec,
-            env_i=0,
-            surface_contact_thresh=0.015,
-            min_contact_points=self.config.min_contact_points,
-            contact_target_points=self.config.contact_target_points,
-        )
-        reward_terms = compute_single_door_reward(
-            state=state,
-            prev_state=self.prev_state,
-            action=action_arr,
-            prev_action=self.prev_action,
-            config=self.reward_config,
-        )
+            self._apply_hand_targets(hand_pose=target_pose, hand_qpos=target_qpos, settle_steps=max(1, self.config.action_repeat))
 
-        if state.surface_contact_min_dist < float(self.config.max_safe_penetration):
-            safe_pose = target_pose.copy()
-            safe_pose[:3] += 0.75 * float(self.config.pinch_search_depth_step) * state.handle_out_world
-            self._apply_hand_targets(hand_pose=safe_pose, hand_qpos=target_qpos, settle_steps=1)
             state = extract_single_door_runtime_state(
                 self.gym,
                 self.task_spec,
-                env_i=0,
+                env_i=env_i,
                 surface_contact_thresh=0.015,
                 min_contact_points=self.config.min_contact_points,
                 contact_target_points=self.config.contact_target_points,
             )
             reward_terms = compute_single_door_reward(
                 state=state,
-                prev_state=self.prev_state,
-                action=action_arr,
-                prev_action=self.prev_action,
+                prev_state=self.prev_state[env_i],
+                action=env_action,
+                prev_action=self.prev_action[env_i],
                 config=self.reward_config,
             )
-            target_pose = safe_pose
 
-        self.prev_state = state
-        self.prev_action = action_arr.copy()
-        self.last_pose_target = target_pose.copy()
-        self.last_qpos_target = target_qpos.copy()
-        self.step_count += 1
+            severe_penetration = bool(state.surface_contact_min_dist < float(self.config.severe_penetration_threshold))
+            done = bool(
+                state.progress >= self.reward_config.success_progress
+                or int(self.step_count[env_i]) >= self.config.max_episode_steps
+                or severe_penetration
+            )
+            if severe_penetration:
+                reward_terms["total"] -= float(self.config.severe_penetration_termination_penalty)
 
-        done = bool(state.progress >= self.reward_config.success_progress or self.step_count >= self.config.max_episode_steps)
-        obs = build_single_door_observation(
-            state,
-            prev_action=self.prev_action,
-            contact_target_points=self.config.contact_target_points,
-        )
+            obs = build_single_door_observation(
+                state,
+                prev_action=env_action,
+                contact_target_points=self.config.contact_target_points,
+            )
+
+            self.prev_state[env_i] = state
+            self.prev_action[env_i] = env_action.copy()
+            self.last_pose_target[env_i] = target_pose.copy()
+            self.last_qpos_target[env_i] = target_qpos.copy()
+            self.step_count[env_i] += 1
+
+            obs_list.append(obs.astype(np.float32))
+            reward_list.append(float(reward_terms["total"]))
+            done_list.append(done)
+            state_list.append(state)
+            target_pose_list.append(target_pose.copy())
+            target_qpos_list.append(target_qpos.copy())
+            reward_terms_list.append(reward_terms)
+            settle_active_list.append(in_grasp_settle)
+            door_plane_violation_list.append(float(self._door_plane_violation(state)))
+            pinch_debug_list.append(
+                {
+                    "thumb3": int(state.surface_contact_link_counts.get("thumb3", 0)),
+                    "index3": int(state.surface_contact_link_counts.get("index3", 0)),
+                    "middle3": int(state.surface_contact_link_counts.get("middle3", 0)),
+                    "ring3": int(state.surface_contact_link_counts.get("ring3", 0)),
+                    "pinky3": int(state.surface_contact_link_counts.get("pinky3", 0)),
+                }
+            )
+
+        obs_batch = np.stack(obs_list, axis=0).astype(np.float32)
+        reward_batch = np.asarray(reward_list, dtype=np.float32)
+        done_batch = np.asarray(done_list, dtype=np.bool_)
         info = {
-            "step_count": int(self.step_count),
+            "step_count": self.step_count.astype(np.int32),
             "curriculum_phase": self.get_curriculum_phase(),
             "teacher_action": _to_jsonable(teacher_targets["teacher_action"]),
             "teacher_target_pose": _to_jsonable(teacher_targets["teacher_target_pose"]),
             "teacher_target_qpos": _to_jsonable(teacher_targets["teacher_target_qpos"]),
             "teacher_qpos_residual": _to_jsonable(teacher_targets["teacher_qpos_residual"]),
-            "teacher_pull_hint": bool(teacher_targets["teacher_pull_hint"]),
-            "grasp_settle_active": bool(in_grasp_settle),
-            "grasp_settle_counter": int(self.grasp_settle_counter),
-            "contact_features": _to_jsonable(build_contact_feature_vector(state.surface_contact_link_counts)),
+            "teacher_pull_hint": teacher_targets["teacher_pull_hint"],
+            "grasp_settle_active": np.asarray(settle_active_list, dtype=np.bool_),
+            "grasp_settle_counter": self.grasp_settle_counter.astype(np.int32),
+            "contact_features": np.stack([build_contact_feature_vector(state.surface_contact_link_counts) for state in state_list], axis=0).astype(np.float32),
             "contact_target": _to_jsonable(teacher_targets["teacher_contact_target"]),
             "contact_link_order": list(CONTACT_LINK_ORDER),
-            "progress": float(state.progress),
-            "drive_dof_val": float(state.drive_dof_val),
-            "drive_dof_vel": float(state.drive_dof_vel),
-            "surface_contact_count": int(state.surface_contact_count),
-            "surface_contact_stable": bool(state.surface_contact_stable),
-            "door_plane_violation": float(self._door_plane_violation(state)),
-            "surface_contact_link_counts": dict(state.surface_contact_link_counts),
-            "pinch_debug": {
-                "thumb3": int(state.surface_contact_link_counts.get("thumb3", 0)),
-                "index3": int(state.surface_contact_link_counts.get("index3", 0)),
-                "middle3": int(state.surface_contact_link_counts.get("middle3", 0)),
-                "ring3": int(state.surface_contact_link_counts.get("ring3", 0)),
-                "pinky3": int(state.surface_contact_link_counts.get("pinky3", 0)),
-            },
-            "target_pose": _to_jsonable(target_pose),
-            "target_qpos": _to_jsonable(target_qpos),
-            "reward_terms": reward_terms,
-            "success": bool(state.progress >= self.reward_config.success_progress),
+            "progress": np.asarray([state.progress for state in state_list], dtype=np.float32),
+            "drive_dof_val": np.asarray([state.drive_dof_val for state in state_list], dtype=np.float32),
+            "drive_dof_vel": np.asarray([state.drive_dof_vel for state in state_list], dtype=np.float32),
+            "surface_contact_count": np.asarray([state.surface_contact_count for state in state_list], dtype=np.int32),
+            "surface_contact_stable": np.asarray([state.surface_contact_stable for state in state_list], dtype=np.bool_),
+            "surface_contact_min_dist": np.asarray([state.surface_contact_min_dist for state in state_list], dtype=np.float32),
+            "door_plane_violation": np.asarray(door_plane_violation_list, dtype=np.float32),
+            "surface_contact_link_counts": [dict(state.surface_contact_link_counts) for state in state_list],
+            "pinch_debug": pinch_debug_list,
+            "target_pose": _to_jsonable(np.stack(target_pose_list, axis=0).astype(np.float32)),
+            "target_qpos": _to_jsonable(np.stack(target_qpos_list, axis=0).astype(np.float32)),
+            "reward_terms": reward_terms_list,
+            "success": np.asarray([state.progress >= self.reward_config.success_progress for state in state_list], dtype=np.bool_),
+            "severe_penetration_terminated": np.asarray(
+                [state.surface_contact_min_dist < float(self.config.severe_penetration_threshold) for state in state_list],
+                dtype=np.bool_,
+            ),
             "task_spec": self.task_spec.to_dict(),
         }
-        return obs.astype(np.float32), float(reward_terms["total"]), done, info
+        if self.config.num_envs == 1:
+            return obs_batch[0], float(reward_batch[0]), bool(done_batch[0]), {k: (v[0] if isinstance(v, np.ndarray) and v.shape[0] == 1 else v) for k, v in info.items()}
+        return obs_batch, reward_batch, done_batch, info
 
     def close(self) -> None:
         if hasattr(self, "gym") and self.gym is not None:

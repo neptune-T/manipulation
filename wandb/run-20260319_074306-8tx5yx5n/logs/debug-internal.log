@@ -1,0 +1,18 @@
+{"time":"2026-03-19T07:43:07.726562967+08:00","level":"INFO","msg":"stream: starting","core version":"0.24.1"}
+{"time":"2026-03-19T07:43:09.380698306+08:00","level":"INFO","msg":"stream: created new stream","id":"8tx5yx5n"}
+{"time":"2026-03-19T07:43:09.384831544+08:00","level":"INFO","msg":"handler: started","stream_id":"8tx5yx5n"}
+{"time":"2026-03-19T07:43:09.38505843+08:00","level":"INFO","msg":"stream: started","id":"8tx5yx5n"}
+{"time":"2026-03-19T07:43:09.385145475+08:00","level":"INFO","msg":"writer: started","stream_id":"8tx5yx5n"}
+{"time":"2026-03-19T07:43:09.387568293+08:00","level":"INFO","msg":"sender: started","stream_id":"8tx5yx5n"}
+{"time":"2026-03-19T11:44:47.476366603+08:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/files/2980976495-peking-university/gapartnet-hoi/8tx5yx5n/file_stream\": read tcp 198.18.0.1:42278->35.186.228.49:443: read: connection reset by peer"}
+{"time":"2026-03-19T11:48:32.04431399+08:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/files/2980976495-peking-university/gapartnet-hoi/8tx5yx5n/file_stream\": net/http: request canceled (Client.Timeout exceeded while awaiting headers)"}
+{"time":"2026-03-19T11:50:44.003409454+08:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/files/2980976495-peking-university/gapartnet-hoi/8tx5yx5n/file_stream\": unexpected EOF"}
+{"time":"2026-03-19T12:01:20.646706803+08:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/files/2980976495-peking-university/gapartnet-hoi/8tx5yx5n/file_stream\": unexpected EOF"}
+{"time":"2026-03-19T12:12:23.851508692+08:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/files/2980976495-peking-university/gapartnet-hoi/8tx5yx5n/file_stream\": unexpected EOF"}
+{"time":"2026-03-19T12:34:26.875223948+08:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/files/2980976495-peking-university/gapartnet-hoi/8tx5yx5n/file_stream\": unexpected EOF"}
+{"time":"2026-03-19T20:41:00.541674177+08:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2026-03-19T20:41:13.317958333+08:00","level":"INFO","msg":"handler: operation stats","stats":{}}
+{"time":"2026-03-19T20:41:13.33346682+08:00","level":"INFO","msg":"stream: closing","id":"8tx5yx5n"}
+{"time":"2026-03-19T20:41:13.333489211+08:00","level":"INFO","msg":"handler: closed","stream_id":"8tx5yx5n"}
+{"time":"2026-03-19T20:41:13.333575464+08:00","level":"INFO","msg":"sender: closed","stream_id":"8tx5yx5n"}
+{"time":"2026-03-19T20:41:13.33358518+08:00","level":"INFO","msg":"stream: closed","id":"8tx5yx5n"}
