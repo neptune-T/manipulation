@@ -33,7 +33,7 @@ class PPOConfig:
     gae_lambda: float = 0.95
     clip_ratio: float = 0.2
     value_coef: float = 0.5
-    entropy_coef: float = 0.001
+    entropy_coef: float = 0.005
     lr: float = 3e-4
     epochs: int = 4
     minibatch_size: int = 128
@@ -157,6 +157,7 @@ def main():
     parser.add_argument("--teacher-forcing-decay", type=float, default=0.90)
     parser.add_argument("--teacher-forcing-success-threshold", type=float, default=0.80)
     parser.add_argument("--teacher-forcing-window", type=int, default=20)
+    parser.add_argument("--entropy-coef", type=float, default=0.005)
     parser.add_argument("--contact-aux-coef", type=float, default=0.2)
     parser.add_argument("--curriculum-enabled", action="store_true", default=False)
     parser.add_argument("--wandb", action="store_true", default=False)
@@ -184,6 +185,7 @@ def main():
         bc_coef=float(args.bc_coef),
         bc_coef_min=float(args.bc_coef_min),
         bc_coef_decay=float(args.bc_coef_decay),
+        entropy_coef=float(args.entropy_coef),
         contact_aux_coef=float(args.contact_aux_coef),
         teacher_forcing_coef=float(args.teacher_forcing_coef),
         teacher_forcing_min=float(args.teacher_forcing_min),
@@ -239,6 +241,11 @@ def main():
         train_stats_history = []
 
         for update in range(1, ppo_cfg.total_updates + 1):
+            # Linear learning rate annealing
+            lr_frac = 1.0 - (update - 1) / ppo_cfg.total_updates
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = ppo_cfg.lr * lr_frac
+
             obs_buf = np.zeros((ppo_cfg.rollout_steps, num_envs, obs_dim), dtype=np.float32)
             action_buf = np.zeros((ppo_cfg.rollout_steps, num_envs, action_dim), dtype=np.float32)
             logp_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
@@ -264,9 +271,16 @@ def main():
                 ).astype(np.float32)
                 next_obs, reward, done, info = env.step(action)
 
+                # Recompute log_prob for the *blended* action that was actually executed,
+                # so that old_logp matches the action stored in action_buf.
+                with torch.no_grad():
+                    blended_tensor = torch.tensor(action, dtype=torch.float32, device=torch_device)
+                    mean_t, std_t, _, _ = model.forward(obs_tensor)
+                    blended_logp = torch.distributions.Normal(mean_t, std_t).log_prob(blended_tensor).sum(-1)
+
                 obs_buf[step] = obs
                 action_buf[step] = action
-                logp_buf[step] = np.asarray(logp_tensor.cpu().numpy(), dtype=np.float32)
+                logp_buf[step] = np.asarray(blended_logp.cpu().numpy(), dtype=np.float32)
                 reward_buf[step] = np.asarray(reward, dtype=np.float32)
                 done_buf[step] = np.asarray(done, dtype=np.float32)
                 value_buf[step] = np.asarray(value_tensor.cpu().numpy(), dtype=np.float32)
@@ -316,7 +330,8 @@ def main():
                 gamma=ppo_cfg.gamma,
                 gae_lambda=ppo_cfg.gae_lambda,
             )
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            # Normalize advantages per-minibatch below instead of globally,
+            # to reduce bias with small batch sizes.
 
             flat_obs = obs_buf.reshape(-1, obs_dim)
             flat_actions = action_buf.reshape(-1, action_dim)
@@ -341,7 +356,10 @@ def main():
             batch_size = ppo_cfg.rollout_steps * num_envs
             inds = np.arange(batch_size)
             last_stats = {}
+            kl_early_stop = False
             for _ in range(ppo_cfg.epochs):
+                if kl_early_stop:
+                    break
                 np.random.shuffle(inds)
                 for start in range(0, batch_size, ppo_cfg.minibatch_size):
                     end = start + ppo_cfg.minibatch_size
@@ -350,6 +368,7 @@ def main():
                     mb_actions = action_tensor[mb_inds]
                     mb_old_logp = old_logp_tensor[mb_inds]
                     mb_adv = adv_tensor[mb_inds]
+                    mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
                     mb_returns = ret_tensor[mb_inds]
                     mb_contact_vec_target = contact_vec_target_tensor[mb_inds]
                     mb_teacher_action = teacher_action_tensor[mb_inds]
@@ -381,8 +400,11 @@ def main():
                     loss.backward()
                     nn.utils.clip_grad_norm_(model.parameters(), ppo_cfg.max_grad_norm)
                     optimizer.step()
-                    approx_kl = torch.mean(mb_old_logp - new_logp).item()
+                    approx_kl = torch.mean((ratio - 1) - torch.log(ratio)).item()
                     clipfrac = torch.mean((torch.abs(ratio - 1.0) > ppo_cfg.clip_ratio).float()).item()
+                    if approx_kl > 0.015:
+                        kl_early_stop = True
+                        break
                     last_stats = {
                         "policy_loss": float(policy_loss.item()),
                         "value_loss": float(value_loss.item()),
@@ -392,6 +414,7 @@ def main():
                         "teacher_qpos_residual_l1": float(qpos_residual_norm.item()),
                         "approx_kl": float(approx_kl),
                         "clipfrac": float(clipfrac),
+                        "learning_rate": float(optimizer.param_groups[0]["lr"]),
                     }
 
             recent = history[-5:]
