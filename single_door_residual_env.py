@@ -396,8 +396,12 @@ class SingleDoorResidualEnv:
         if self.task_spec.joint_type in ["revolute", "continuous"]:
             cfgs["asset"]["arti_shape_contact_offset"] = 0.005
             cfgs["asset"]["arti_shape_thickness"] = 0.02
-            cfgs["asset"]["mano_shape_contact_offset"] = 0.005
-            cfgs["asset"]["mano_shape_thickness"] = 0.02
+            # Slim down MANO collision bodies to prevent ghost-overlap with the
+            # door panel.  Smaller contact_offset + thickness gives the fingers
+            # enough physical clearance to wrap around the handle without the
+            # physics engine treating a near-miss as a solid contact.
+            cfgs["asset"]["mano_shape_contact_offset"] = 0.002
+            cfgs["asset"]["mano_shape_thickness"] = 0.005
             cfgs["asset"]["mano_shape_friction"] = 5.0
             cfgs["asset"]["mano_dof_stiffness"] = 400.0
             cfgs["asset"]["mano_dof_damping"] = 30.0

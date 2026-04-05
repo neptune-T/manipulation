@@ -51,6 +51,7 @@ class PPOConfig:
     teacher_forcing_decay: float = 0.90
     teacher_forcing_success_threshold: float = 0.80
     teacher_forcing_window: int = 20
+    target_kl: float = 0.015
 
 
 class ActorCritic(nn.Module):
@@ -159,6 +160,7 @@ def main():
     parser.add_argument("--teacher-forcing-window", type=int, default=20)
     parser.add_argument("--entropy-coef", type=float, default=0.005)
     parser.add_argument("--contact-aux-coef", type=float, default=0.2)
+    parser.add_argument("--target-kl", type=float, default=0.015)
     parser.add_argument("--curriculum-enabled", action="store_true", default=False)
     parser.add_argument("--wandb", action="store_true", default=False)
     parser.add_argument("--wandb-project", type=str, default="gapartnet-hoi")
@@ -192,6 +194,7 @@ def main():
         teacher_forcing_decay=float(args.teacher_forcing_decay),
         teacher_forcing_success_threshold=float(args.teacher_forcing_success_threshold),
         teacher_forcing_window=int(args.teacher_forcing_window),
+        target_kl=float(args.target_kl),
     )
 
     env = SingleDoorResidualEnv(env_cfg)
@@ -254,7 +257,6 @@ def main():
             value_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
             contact_vec_target_buf = np.zeros((ppo_cfg.rollout_steps, num_envs, 6), dtype=np.float32)
             teacher_action_buf = np.zeros((ppo_cfg.rollout_steps, num_envs, action_dim), dtype=np.float32)
-            teacher_qpos_residual_buf = np.zeros((ppo_cfg.rollout_steps, num_envs, 20), dtype=np.float32)
             progress_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
             stable_contact_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
 
@@ -280,23 +282,24 @@ def main():
 
                 obs_buf[step] = obs
                 action_buf[step] = action
-                logp_buf[step] = np.asarray(blended_logp.cpu().numpy(), dtype=np.float32)
-                reward_buf[step] = np.asarray(reward, dtype=np.float32)
-                done_buf[step] = np.asarray(done, dtype=np.float32)
-                value_buf[step] = np.asarray(value_tensor.cpu().numpy(), dtype=np.float32)
-                contact_vec_target_buf[step] = np.asarray(info["contact_target"], dtype=np.float32)
-                teacher_action_buf[step] = teacher_action
-                teacher_qpos_residual_buf[step] = np.asarray(info["teacher_qpos_residual"], dtype=np.float32)
-                progress_buf[step] = np.asarray(info["progress"], dtype=np.float32)
-                stable_contact_buf[step] = np.asarray(info["surface_contact_stable"], dtype=np.float32)
+                logp_buf[step] = np.atleast_1d(np.asarray(blended_logp.cpu().numpy(), dtype=np.float32))
+                reward_buf[step] = np.atleast_1d(np.asarray(reward, dtype=np.float32))
+                done_buf[step] = np.atleast_1d(np.asarray(done, dtype=np.float32))
+                value_buf[step] = np.atleast_1d(np.asarray(value_tensor.cpu().numpy(), dtype=np.float32))
+                contact_vec_target_buf[step] = np.asarray(info["contact_target"], dtype=np.float32).reshape(num_envs, 6)
+                teacher_action_buf[step] = np.asarray(teacher_action, dtype=np.float32).reshape(num_envs, action_dim)
+                progress_buf[step] = np.atleast_1d(np.asarray(info["progress"], dtype=np.float32))
+                stable_contact_buf[step] = np.atleast_1d(np.asarray(info["surface_contact_stable"], dtype=np.float32))
 
-                obs = next_obs
-                episode_return += np.asarray(reward, dtype=np.float32)
+                obs = np.asarray(next_obs, dtype=np.float32)
+                if obs.ndim == 1:
+                    obs = obs[None, :]
+                episode_return += np.atleast_1d(np.asarray(reward, dtype=np.float32))
                 episode_length += 1
 
-                done_arr = np.asarray(done, dtype=bool)
-                success_arr = np.asarray(info["success"], dtype=bool)
-                progress_arr = np.asarray(info["progress"], dtype=np.float32)
+                done_arr = np.atleast_1d(np.asarray(done, dtype=bool))
+                success_arr = np.atleast_1d(np.asarray(info["success"], dtype=bool))
+                progress_arr = np.atleast_1d(np.asarray(info["progress"], dtype=np.float32))
                 if np.any(done_arr):
                     curriculum_info = env.update_curriculum(bool(np.mean(success_arr.astype(np.float32)) > 0.5))
                     for env_i in np.where(done_arr)[0]:
@@ -340,7 +343,6 @@ def main():
             flat_returns = returns.reshape(-1)
             flat_contact = contact_vec_target_buf.reshape(-1, 6)
             flat_teacher_action = teacher_action_buf.reshape(-1, action_dim)
-            flat_teacher_qpos = teacher_qpos_residual_buf.reshape(-1, 20)
             flat_values = value_buf.reshape(-1)
 
             obs_tensor = torch.tensor(flat_obs, dtype=torch.float32, device=torch_device)
@@ -350,7 +352,6 @@ def main():
             ret_tensor = torch.tensor(flat_returns, dtype=torch.float32, device=torch_device)
             contact_vec_target_tensor = torch.tensor(flat_contact, dtype=torch.float32, device=torch_device)
             teacher_action_tensor = torch.tensor(flat_teacher_action, dtype=torch.float32, device=torch_device)
-            teacher_qpos_residual_tensor = torch.tensor(flat_teacher_qpos, dtype=torch.float32, device=torch_device)
             old_value_tensor = torch.tensor(flat_values, dtype=torch.float32, device=torch_device)
 
             batch_size = ppo_cfg.rollout_steps * num_envs
@@ -372,7 +373,6 @@ def main():
                     mb_returns = ret_tensor[mb_inds]
                     mb_contact_vec_target = contact_vec_target_tensor[mb_inds]
                     mb_teacher_action = teacher_action_tensor[mb_inds]
-                    mb_teacher_qpos_residual = teacher_qpos_residual_tensor[mb_inds]
                     mb_old_value = old_value_tensor[mb_inds]
 
                     new_logp, entropy, value, contact_logit, action_mean = model.evaluate_actions(mb_obs, mb_actions)
@@ -387,7 +387,6 @@ def main():
                     entropy_loss = entropy.mean()
                     bc_loss = torch.mean((action_mean - mb_teacher_action) ** 2)
                     contact_aux_loss = nn.functional.binary_cross_entropy_with_logits(contact_logit, mb_contact_vec_target)
-                    qpos_residual_norm = torch.mean(torch.abs(mb_teacher_qpos_residual))
                     loss = (
                         policy_loss
                         + ppo_cfg.value_coef * value_loss
@@ -402,7 +401,7 @@ def main():
                     optimizer.step()
                     approx_kl = torch.mean((ratio - 1) - torch.log(ratio)).item()
                     clipfrac = torch.mean((torch.abs(ratio - 1.0) > ppo_cfg.clip_ratio).float()).item()
-                    if approx_kl > 0.015:
+                    if approx_kl > ppo_cfg.target_kl:
                         kl_early_stop = True
                         break
                     last_stats = {
@@ -411,7 +410,6 @@ def main():
                         "entropy": float(entropy_loss.item()),
                         "bc_loss": float(bc_loss.item()),
                         "contact_aux_loss": float(contact_aux_loss.item()),
-                        "teacher_qpos_residual_l1": float(qpos_residual_norm.item()),
                         "approx_kl": float(approx_kl),
                         "clipfrac": float(clipfrac),
                         "learning_rate": float(optimizer.param_groups[0]["lr"]),
@@ -434,12 +432,23 @@ def main():
                     float(ppo_cfg.bc_coef_min),
                     float(ppo_cfg.bc_coef) * float(ppo_cfg.bc_coef_decay),
                 )
+            elif update % 50 == 0:
+                # Slow time-based fallback decay to prevent permanently stuck
+                # imitation when the success threshold is never reached.
+                slow_decay = 0.98
+                ppo_cfg.teacher_forcing_coef = max(
+                    float(ppo_cfg.teacher_forcing_min),
+                    float(ppo_cfg.teacher_forcing_coef) * slow_decay,
+                )
+                ppo_cfg.bc_coef = max(
+                    float(ppo_cfg.bc_coef_min),
+                    float(ppo_cfg.bc_coef) * slow_decay,
+                )
             print(
                 f"update={update:04d} avg_return={avg_return:.3f} "
                 f"avg_progress={avg_progress:.4f} success_rate={success_rate:.2f} "
                 f"rollout_contact={rollout_contact_rate:.2f} rollout_prog={rollout_progress:.4f} "
                 f"bc={last_stats.get('bc_loss', 0.0):.4f} contact_aux={last_stats.get('contact_aux_loss', 0.0):.4f} "
-                f"qpos_res={last_stats.get('teacher_qpos_residual_l1', 0.0):.4f} "
                 f"tf={ppo_cfg.teacher_forcing_coef:.2f} bc_coef={ppo_cfg.bc_coef:.3f} tf_recent={tf_recent_success:.2f} "
                 f"phase={env.get_curriculum_phase()}"
             )

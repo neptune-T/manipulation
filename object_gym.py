@@ -1,6 +1,5 @@
 
-from isaacgym import gymutil
-from isaacgym import gymtorch
+from isaacgym import gymapi, gymutil, gymtorch
 from isaacgym.torch_utils import *
 import imageio
 import open3d as o3d
@@ -18,7 +17,7 @@ from scipy.spatial.transform import Rotation as R
 import sys
 sys.path.append("../")
 sys.path.append("../vision")
-sys.path.append(". /gym")
+sys.path.append("./gym")
 import torch
 # import numpy as np
 import json
@@ -1359,8 +1358,22 @@ class ObjectGym():
             thresh=surface_contact_thresh,
         )
         contact_count = int(contact_mask.to(torch.int32).sum().item())
-        min_dist = float(min_dists.min().item())
         link_counts_int = {k: int(v.item()) for k, v in link_counts.items()}
+
+        # Compute actual signed distance so penetration (negative) is detectable.
+        # The unsigned cdist min_dist is always >= 0 and cannot represent penetration.
+        merged_hand_points, _ = self.contact_calc._compute_hand_surface_points_world(
+            h_pos, h_rot, h_qpos
+        )
+        try:
+            signed_dists, _, _ = self.contact_calc.compute_batch_signed_distance(
+                merged_hand_points, o_pos, o_rot, o_qpos,
+            )
+            min_dist = float(signed_dists.min().item())
+        except (RuntimeError, AttributeError):
+            # Fallback: unsigned distance if normals unavailable
+            min_dist = float(min_dists.min().item())
+
         return contact_count, link_counts_int, min_dist
 
     def stabilize_grasp_by_surface_contact(

@@ -343,6 +343,8 @@ class SingleDoorRewardConfig:
     sdf_far_margin: float = 0.015
     outside_grasp_bonus_gate: float = 0.45
     outside_grasp_penalty: float = 4.0
+    panel_penetration_weight: float = 5.0
+    panel_penetration_scale: float = 200.0
 
 
 def select_single_door_task(asset_dir: str, door_index: int = 0, preferred_door_link: Optional[str] = None, preferred_handle_link: Optional[str] = None) -> SingleDoorTaskSpec:
@@ -838,23 +840,37 @@ def compute_single_door_reward(
         detach_penalty = 1.0
     if pinch_reward < 0.15 and reach_dist < 0.05:
         detach_penalty += 0.5
+    # --- Penetration penalties (surface_contact_min_dist < 0 means inside object) ---
+    penetration_depth = float(max(0.0, -state.surface_contact_min_dist))
+    # Mild penalty that ramps linearly with penetration depth (original behaviour,
+    # but now actually fires because min_dist is signed).
     penetration_penalty = 0.0
-    palm_penalty = 0.0
-    if state.surface_contact_min_dist < -0.0015:
-        penetration_penalty = float(min(0.03, -state.surface_contact_min_dist))
+    if state.surface_contact_min_dist < -0.001:
+        penetration_penalty = float(min(0.05, penetration_depth))
+        # Nullify any progress/tangent reward obtained via cheating through the panel
         if progress_delta > 0.0:
             progress_reward = 0.0
             tangent_reward = 0.0
-    sdf_penetration_penalty = float(max(0.0, -state.surface_contact_min_dist))
+    # Heavy flat penalty: a large negative hit whenever any hand point is inside
+    # the door panel.  This teaches the agent that "phasing through" is never
+    # worth the progress it might gain.  The penalty is proportional to depth
+    # but with a steep scale and a guaranteed floor of 1.0 so even a tiny
+    # penetration is strongly punished.
+    panel_penetration_penalty = 0.0
+    if penetration_depth > 0.0:
+        panel_penetration_penalty = float(1.0 + cfg.panel_penetration_scale * penetration_depth)
+    # Continuous SDF-based repulsion (softer gradient for the optimiser)
+    sdf_penetration_penalty = penetration_depth
     palm_contact = float(state.surface_contact_link_counts.get("palm", 0))
     fingertip_contact = float(
         state.surface_contact_link_counts.get("thumb3", 0)
         + state.surface_contact_link_counts.get("index3", 0)
         + state.surface_contact_link_counts.get("middle3", 0)
     )
+    palm_penalty = 0.0
     if palm_contact > 0 and state.surface_contact_min_dist < -float(cfg.fingertip_penetration_allowance):
         palm_ratio = palm_contact / max(1.0, fingertip_contact + palm_contact)
-        palm_penalty = float(min(0.05, palm_ratio * abs(state.surface_contact_min_dist)))
+        palm_penalty = float(min(0.05, palm_ratio * penetration_depth))
 
     action_l2 = 0.0 if action is None else float(np.mean(np.square(np.asarray(action, dtype=np.float32))))
     action_smooth = 0.0
@@ -880,6 +896,7 @@ def compute_single_door_reward(
         - cfg.detach_penalty_weight * detach_penalty
         - cfg.penetration_progress_penalty * penetration_penalty
         - cfg.sdf_penetration_weight * sdf_penetration_penalty
+        - cfg.panel_penetration_weight * panel_penetration_penalty
         - cfg.palm_penetration_penalty * palm_penalty
         - (0.0 if outside_grasp_ok else cfg.outside_grasp_penalty * max(0.0, state.progress))
         - cfg.action_l2_weight * action_l2
@@ -909,6 +926,7 @@ def compute_single_door_reward(
         "detach_penalty": float(detach_penalty),
         "penetration_penalty": float(penetration_penalty),
         "sdf_penetration_penalty": float(sdf_penetration_penalty),
+        "panel_penetration_penalty": float(panel_penetration_penalty),
         "palm_penalty": float(palm_penalty),
         "action_l2_penalty": float(action_l2),
         "action_smooth_penalty": float(action_smooth),
