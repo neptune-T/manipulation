@@ -429,19 +429,19 @@
 		<collision>
 			<origin xyz="0.3990322923139692 0.8448920249938966 -0.3754050304999294"/>
 			<geometry>
-				<mesh filename="textured_objs/original-38.obj"/>
+				<mesh filename="textured_objs/original-38.obj" scale="1.5 2.0 1.0"/>
 			</geometry>
 		</collision>
 		<collision>
 			<origin xyz="0.3990322923139692 0.8448920249938966 -0.3754050304999294"/>
 			<geometry>
-				<mesh filename="textured_objs/original-39.obj"/>
+				<mesh filename="textured_objs/original-39.obj" scale="1.5 2.0 1.0"/>
 			</geometry>
 		</collision>
 		<collision>
 			<origin xyz="0.3990322923139692 0.8448920249938966 -0.3754050304999294"/>
 			<geometry>
-				<mesh filename="textured_objs/original-40.obj"/>
+				<mesh filename="textured_objs/original-40.obj" scale="1.5 2.0 1.0"/>
 			</geometry>
 		</collision>
 	</link>
@@ -472,19 +472,19 @@
 		<collision>
 			<origin xyz="-0.02282584888658025 -0.27756666188211254 0.3846589922904968"/>
 			<geometry>
-				<mesh filename="textured_objs/original-30.obj"/>
+				<mesh filename="textured_objs/original-30.obj" scale="1.5 2.0 1.0"/>
 			</geometry>
 		</collision>
 		<collision>
 			<origin xyz="-0.02282584888658025 -0.27756666188211254 0.3846589922904968"/>
 			<geometry>
-				<mesh filename="textured_objs/original-31.obj"/>
+				<mesh filename="textured_objs/original-31.obj" scale="1.5 2.0 1.0"/>
 			</geometry>
 		</collision>
 		<collision>
 			<origin xyz="-0.02282584888658025 -0.27756666188211254 0.3846589922904968"/>
 			<geometry>
-				<mesh filename="textured_objs/original-32.obj"/>
+				<mesh filename="textured_objs/original-32.obj" scale="1.5 2.0 1.0"/>
 			</geometry>
 		</collision>
 	</link>
@@ -515,19 +515,19 @@
 		<collision>
 			<origin xyz="-0.022883973265345255 -0.5506872722285259 0.38465899229049705"/>
 			<geometry>
-				<mesh filename="textured_objs/original-54.obj"/>
+				<mesh filename="textured_objs/original-54.obj" scale="1.5 2.0 1.0"/>
 			</geometry>
 		</collision>
 		<collision>
 			<origin xyz="-0.022883973265345255 -0.5506872722285259 0.38465899229049705"/>
 			<geometry>
-				<mesh filename="textured_objs/original-55.obj"/>
+				<mesh filename="textured_objs/original-55.obj" scale="1.5 2.0 1.0"/>
 			</geometry>
 		</collision>
 		<collision>
 			<origin xyz="-0.022883973265345255 -0.5506872722285259 0.38465899229049705"/>
 			<geometry>
-				<mesh filename="textured_objs/original-56.obj"/>
+				<mesh filename="textured_objs/original-56.obj" scale="1.5 2.0 1.0"/>
 			</geometry>
 		</collision>
 	</link>

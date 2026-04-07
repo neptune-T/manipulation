@@ -7,6 +7,7 @@ import cv2
 import math
 import numpy as np
 import torch
+import torch.nn.functional as F
 import time
 import trimesh as tm
 from utils import images_to_video, orientation_error, \
@@ -49,6 +50,287 @@ if True:
     from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig, MotionGenPlanConfig
     from curobo.cuda_robot_model.cuda_robot_model import CudaRobotModel, CudaRobotModelConfig
     from curobo.util_file import get_robot_path, join_path, load_yaml
+
+def _ensure_batched_points(points: torch.Tensor) -> torch.Tensor:
+    """
+    Normalize point cloud tensor to shape [B, N, 3].
+    """
+    if not torch.is_tensor(points):
+        points = torch.as_tensor(points, dtype=torch.float32)
+    if points.ndim == 2:
+        points = points.unsqueeze(0)
+    if points.ndim != 3 or points.shape[-1] != 3:
+        raise ValueError(f"Expected point cloud shape [B, N, 3], got {tuple(points.shape)}")
+    return points
+
+
+def _ensure_batched_mask(mask: torch.Tensor, batch_size: int, num_points: int) -> torch.Tensor:
+    """
+    Normalize semantic mask tensor to shape [B, N].
+    """
+    if not torch.is_tensor(mask):
+        mask = torch.as_tensor(mask)
+    if mask.ndim == 1:
+        mask = mask.unsqueeze(0)
+    if mask.ndim != 2:
+        raise ValueError(f"Expected mask shape [B, N], got {tuple(mask.shape)}")
+    if mask.shape[0] != batch_size or mask.shape[1] != num_points:
+        raise ValueError(
+            f"Mask shape {tuple(mask.shape)} does not match points shape [B={batch_size}, N={num_points}]"
+        )
+    return mask
+
+
+def extract_part_point_cloud(
+    points_xyz,
+    semantic_part_mask,
+    keep_part_ids=(1, 3, 9),
+):
+    """
+    根据 GAPartNet 的 semantic part id，从整张点云中提取目标部件点。
+
+    返回:
+        selected_points: [B, N, 3]，仍保持原始点云张量，便于后续 batch 计算。
+        selected_mask:   [B, N] bool，True 表示该点属于 keep_part_ids，对应 P_handle。
+
+    说明:
+    - 这里采用“点云 + bool mask”的表示，而不是变长列表，便于 GPU batch 计算和可导 loss。
+    """
+    points_xyz = _ensure_batched_points(points_xyz)
+    semantic_part_mask = _ensure_batched_mask(
+        semantic_part_mask, batch_size=points_xyz.shape[0], num_points=points_xyz.shape[1]
+    ).to(points_xyz.device)
+
+    keep_part_ids = torch.as_tensor(
+        list(keep_part_ids), dtype=semantic_part_mask.dtype, device=semantic_part_mask.device
+    )
+    selected_mask = (semantic_part_mask.unsqueeze(-1) == keep_part_ids.view(1, 1, -1)).any(dim=-1)
+    return points_xyz, selected_mask
+
+
+def split_interaction_part_points(
+    points_xyz,
+    semantic_part_mask,
+    handle_part_ids=(1, 3, 9),
+    background_part_ids=(0, -1, 255),
+):
+    """
+    将整张点云拆成:
+    - P_handle:       目标交互部件（把手/按钮）
+    - P_non_interact: 其余非交互部件（如门板、柜体等）
+
+    返回:
+        dict {
+            "points": [B, N, 3],
+            "handle_mask": [B, N] bool,
+            "non_interact_mask": [B, N] bool,
+            "valid_object_mask": [B, N] bool,
+        }
+    """
+    points_xyz = _ensure_batched_points(points_xyz)
+    semantic_part_mask = _ensure_batched_mask(
+        semantic_part_mask, batch_size=points_xyz.shape[0], num_points=points_xyz.shape[1]
+    ).to(points_xyz.device)
+
+    _, handle_mask = extract_part_point_cloud(
+        points_xyz=points_xyz,
+        semantic_part_mask=semantic_part_mask,
+        keep_part_ids=handle_part_ids,
+    )
+
+    background_part_ids = torch.as_tensor(
+        list(background_part_ids), dtype=semantic_part_mask.dtype, device=semantic_part_mask.device
+    )
+    is_background = (semantic_part_mask.unsqueeze(-1) == background_part_ids.view(1, 1, -1)).any(dim=-1)
+    valid_object_mask = ~is_background
+    non_interact_mask = valid_object_mask & (~handle_mask)
+
+    return {
+        "points": points_xyz,
+        "handle_mask": handle_mask,
+        "non_interact_mask": non_interact_mask,
+        "valid_object_mask": valid_object_mask,
+    }
+
+
+def _masked_min_cdist(query_xyz, ref_xyz, ref_mask, inf=1e6):
+    """
+    计算 query 到 masked reference point set 的最短 L2 距离。
+
+    输入:
+        query_xyz: [B, M, 3]
+        ref_xyz:   [B, N, 3]
+        ref_mask:  [B, N] bool
+
+    返回:
+        min_dist:      [B, M]
+        valid_batches: [B] bool，表示该 batch 是否有至少一个有效参考点
+    """
+    query_xyz = _ensure_batched_points(query_xyz)
+    ref_xyz = _ensure_batched_points(ref_xyz).to(query_xyz.device)
+    ref_mask = _ensure_batched_mask(ref_mask, batch_size=ref_xyz.shape[0], num_points=ref_xyz.shape[1]).to(query_xyz.device)
+    ref_mask = ref_mask.to(dtype=torch.bool)
+
+    dists = torch.cdist(query_xyz, ref_xyz, p=2)
+    dists = dists.masked_fill(~ref_mask.unsqueeze(1), inf)
+    min_dist = dists.min(dim=-1).values
+
+    valid_batches = ref_mask.any(dim=-1)
+    min_dist = torch.where(valid_batches.unsqueeze(-1), min_dist, torch.zeros_like(min_dist))
+    return min_dist, valid_batches
+
+
+def targeted_attraction_loss(
+    fingertip_xyz,
+    handle_points_xyz,
+    handle_mask,
+    margin=0.02,
+    reduction="mean",
+):
+    """
+    部件级定向吸附损失:
+    - 只对把手/按钮点云 P_handle 计算 10 个指尖的最近距离。
+    - 距离 <= margin 时 loss 为 0，允许有限“软穿透/缓冲”。
+    - 距离 > margin 时，使用平方 hinge 提供稳定吸引梯度。
+    """
+    fingertip_xyz = _ensure_batched_points(fingertip_xyz)
+    handle_points_xyz = _ensure_batched_points(handle_points_xyz).to(fingertip_xyz.device)
+    handle_mask = _ensure_batched_mask(
+        handle_mask, batch_size=handle_points_xyz.shape[0], num_points=handle_points_xyz.shape[1]
+    ).to(fingertip_xyz.device)
+
+    min_handle_dist, valid_batches = _masked_min_cdist(fingertip_xyz, handle_points_xyz, handle_mask)
+    outside_margin = F.relu(min_handle_dist - float(margin))
+    loss_per_tip = outside_margin.pow(2)
+
+    valid_tip_mask = valid_batches.unsqueeze(-1).expand_as(loss_per_tip)
+    if reduction == "none":
+        loss = loss_per_tip
+    else:
+        denom = valid_tip_mask.to(loss_per_tip.dtype).sum().clamp_min(1.0)
+        loss = (loss_per_tip * valid_tip_mask.to(loss_per_tip.dtype)).sum() / denom
+
+    aux = {
+        "min_handle_dist": min_handle_dist,
+        "outside_margin": outside_margin,
+        "valid_handle_batches": valid_batches,
+    }
+    return loss, aux
+
+
+def repulsion_loss(
+    hand_joint_xyz,
+    non_interact_points_xyz,
+    non_interact_mask,
+    hand_radius=0.015,
+    reduction="mean",
+):
+    """
+    避障排斥损失:
+    - 计算手部关节到 P_non_interact 的最近距离。
+    - 若距离小于 hand_radius，则认为发生穿透/危险接近并强烈惩罚。
+
+    这里用 point cloud 近似做“碰撞壳层”:
+        penetration = relu(hand_radius - d_min)
+        loss = penetration^2
+    """
+    hand_joint_xyz = _ensure_batched_points(hand_joint_xyz)
+    non_interact_points_xyz = _ensure_batched_points(non_interact_points_xyz).to(hand_joint_xyz.device)
+    non_interact_mask = _ensure_batched_mask(
+        non_interact_mask,
+        batch_size=non_interact_points_xyz.shape[0],
+        num_points=non_interact_points_xyz.shape[1],
+    ).to(hand_joint_xyz.device)
+
+    min_non_interact_dist, valid_batches = _masked_min_cdist(
+        hand_joint_xyz, non_interact_points_xyz, non_interact_mask
+    )
+
+    if not torch.is_tensor(hand_radius):
+        hand_radius = torch.tensor(hand_radius, dtype=hand_joint_xyz.dtype, device=hand_joint_xyz.device)
+    hand_radius = hand_radius.to(device=hand_joint_xyz.device, dtype=hand_joint_xyz.dtype)
+    if hand_radius.ndim == 0:
+        hand_radius = hand_radius.view(1, 1)
+    elif hand_radius.ndim == 1:
+        hand_radius = hand_radius.view(1, -1)
+
+    penetration = F.relu(hand_radius - min_non_interact_dist)
+    loss_per_joint = penetration.pow(2)
+
+    valid_joint_mask = valid_batches.unsqueeze(-1).expand_as(loss_per_joint)
+    if reduction == "none":
+        loss = loss_per_joint
+    else:
+        denom = valid_joint_mask.to(loss_per_joint.dtype).sum().clamp_min(1.0)
+        loss = (loss_per_joint * valid_joint_mask.to(loss_per_joint.dtype)).sum() / denom
+
+    aux = {
+        "min_non_interact_dist": min_non_interact_dist,
+        "penetration_depth": penetration,
+        "valid_non_interact_batches": valid_batches,
+    }
+    return loss, aux
+
+
+def compute_part_aware_contact_loss(
+    fingertip_xyz,
+    hand_joint_xyz,
+    object_points_xyz,
+    semantic_part_mask,
+    handle_part_ids=(1, 3, 9),
+    background_part_ids=(0, -1, 255),
+    margin=0.02,
+    hand_radius=0.015,
+    attraction_weight=1.0,
+    repulsion_weight=100.0,
+):
+    """
+    总装版 Part-Aware Contact Loss。
+
+    参数约定:
+    - fingertip_xyz:      [B, 10, 3]
+    - hand_joint_xyz:     [B, J, 3]
+    - object_points_xyz:  [B, N, 3]
+    - semantic_part_mask: [B, N]
+
+    返回:
+        total_loss: 标量
+        stats:      调试信息 dict
+    """
+    part_data = split_interaction_part_points(
+        points_xyz=object_points_xyz,
+        semantic_part_mask=semantic_part_mask,
+        handle_part_ids=handle_part_ids,
+        background_part_ids=background_part_ids,
+    )
+
+    attraction, attraction_aux = targeted_attraction_loss(
+        fingertip_xyz=fingertip_xyz,
+        handle_points_xyz=part_data["points"],
+        handle_mask=part_data["handle_mask"],
+        margin=margin,
+    )
+    repulsion, repulsion_aux = repulsion_loss(
+        hand_joint_xyz=hand_joint_xyz,
+        non_interact_points_xyz=part_data["points"],
+        non_interact_mask=part_data["non_interact_mask"],
+        hand_radius=hand_radius,
+    )
+
+    total_loss = float(attraction_weight) * attraction + float(repulsion_weight) * repulsion
+    stats = {
+        "part_contact_loss": total_loss.detach(),
+        "attraction_loss": attraction.detach(),
+        "repulsion_loss": repulsion.detach(),
+        "handle_point_count": part_data["handle_mask"].sum(dim=-1).detach(),
+        "non_interact_point_count": part_data["non_interact_mask"].sum(dim=-1).detach(),
+        "min_handle_dist": attraction_aux["min_handle_dist"].detach(),
+        "min_non_interact_dist": repulsion_aux["min_non_interact_dist"].detach(),
+        "penetration_depth": repulsion_aux["penetration_depth"].detach(),
+        "handle_mask": part_data["handle_mask"],
+        "non_interact_mask": part_data["non_interact_mask"],
+    }
+    return total_loss, stats
 
 class ObjectGym():
     def __init__(
@@ -501,7 +783,16 @@ class ObjectGym():
         ### TODO: support multiple loading
         self.gapartnet_ids = self.cfgs["asset"]["arti_gapartnet_ids"]
         self.gapartnet_root = self.cfgs["asset"]["arti_obj_root"]
-        arti_obj_paths = [f"{self.gapartnet_root}/{gapartnet_id}/mobility_annotation_gapartnet.urdf" for gapartnet_id in self.gapartnet_ids]
+        use_handle_passthrough = bool(self.cfgs.get("asset", {}).get("handle_passthrough", False))
+        if use_handle_passthrough:
+            from single_door_rl_task import prepare_handle_passthrough_urdf
+            arti_obj_paths = []
+            for gapartnet_id in self.gapartnet_ids:
+                asset_dir_abs = os.path.join(self.asset_root, self.gapartnet_root, gapartnet_id)
+                pt_path = prepare_handle_passthrough_urdf(asset_dir_abs)
+                arti_obj_paths.append(os.path.relpath(pt_path, self.asset_root))
+        else:
+            arti_obj_paths = [f"{self.gapartnet_root}/{gapartnet_id}/mobility_annotation_gapartnet.urdf" for gapartnet_id in self.gapartnet_ids]
 
         arti_obj_asset_options = gymapi.AssetOptions()
         # arti_obj_asset_options.disable_gravity = True     # if not disabled, it will need a very initial large force to open a drawer

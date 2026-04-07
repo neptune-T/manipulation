@@ -33,18 +33,18 @@ class PPOConfig:
     gae_lambda: float = 0.95
     clip_ratio: float = 0.2
     value_coef: float = 0.5
-    entropy_coef: float = 0.005
+    entropy_coef: float = 0.008
     lr: float = 3e-4
     epochs: int = 4
     minibatch_size: int = 128
     max_grad_norm: float = 1.0
     hidden_dim: int = 256
-    action_std_init: float = 0.35
+    action_std_init: float = 0.40
     save_every: int = 20
     bc_coef: float = 0.1
     bc_coef_min: float = 0.01
     bc_coef_decay: float = 0.90
-    contact_aux_coef: float = 0.2
+    contact_aux_coef: float = 0.35
     value_clip: float = 0.2
     teacher_forcing_coef: float = 0.25
     teacher_forcing_min: float = 0.05
@@ -149,7 +149,7 @@ def main():
     parser.add_argument("--reset-phase", type=str, default="grasp", choices=["approach", "grasp"])
     parser.add_argument("--reset-pose-noise", type=float, default=0.002)
     parser.add_argument("--reset-rot-noise", type=float, default=0.02)
-    parser.add_argument("--policy-init-std", type=float, default=0.35)
+    parser.add_argument("--policy-init-std", type=float, default=0.40)
     parser.add_argument("--bc-coef", type=float, default=0.1)
     parser.add_argument("--bc-coef-min", type=float, default=0.01)
     parser.add_argument("--bc-coef-decay", type=float, default=0.90)
@@ -158,8 +158,8 @@ def main():
     parser.add_argument("--teacher-forcing-decay", type=float, default=0.90)
     parser.add_argument("--teacher-forcing-success-threshold", type=float, default=0.80)
     parser.add_argument("--teacher-forcing-window", type=int, default=20)
-    parser.add_argument("--entropy-coef", type=float, default=0.005)
-    parser.add_argument("--contact-aux-coef", type=float, default=0.2)
+    parser.add_argument("--entropy-coef", type=float, default=0.008)
+    parser.add_argument("--contact-aux-coef", type=float, default=0.35)
     parser.add_argument("--target-kl", type=float, default=0.015)
     parser.add_argument("--curriculum-enabled", action="store_true", default=False)
     parser.add_argument("--wandb", action="store_true", default=False)

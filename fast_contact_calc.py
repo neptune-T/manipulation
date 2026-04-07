@@ -230,39 +230,105 @@ class FastContactCalculator:
             raise RuntimeError(f"Unexpected batch size for hand points: {merged_hand_points.shape[0]} vs {B}")
         return merged_hand_points, link_slices
 
+    def compute_hand_joint_positions_world(
+        self,
+        hand_root_pos,
+        hand_root_rot,
+        hand_qpos,
+        joint_names=None,
+    ):
+        """
+        Compute MANO joint/link reference positions in world coordinates.
+
+        Returns:
+            hand_joints_world: (B, J, 3)
+            joint_names: List[str]
+        """
+        if joint_names is None:
+            joint_names = list(self.finger_joints)
+        else:
+            joint_names = list(joint_names)
+
+        hand_dict = {name: hand_qpos[:, i] for i, name in enumerate(self.hand_joint_names)}
+        hand_ret = self.hand_chain.forward_kinematics(hand_dict)
+        hand_rot_mat = quat_to_matrix_xyzw(hand_root_rot)
+
+        hand_joints_world = []
+        valid_joint_names = []
+        for jname in joint_names:
+            if jname not in hand_ret:
+                continue
+            local_pos = hand_ret[jname].get_matrix()[:, :3, 3]
+            world_pos = torch.bmm(hand_rot_mat, local_pos.unsqueeze(-1)).squeeze(-1) + hand_root_pos
+            hand_joints_world.append(world_pos)
+            valid_joint_names.append(jname)
+
+        if len(hand_joints_world) == 0:
+            raise RuntimeError("No valid MANO joints found for world-position query.")
+
+        return torch.stack(hand_joints_world, dim=1), valid_joint_names
+
+    def compute_object_surface_points_world(
+        self,
+        obj_root_pos,
+        obj_root_rot,
+        obj_qpos,
+        obj_link_filter=None,
+    ):
+        """
+        Compute object collision surface points in world coordinates.
+
+        Returns:
+            merged_obj_points: (B, N, 3)
+            link_slices: List[(link_name, start, end)]
+        """
+        obj_dict = {name: obj_qpos[:, i] for i, name in enumerate(self.obj_joint_names)}
+        obj_ret = self.obj_chain.forward_kinematics(obj_dict)
+        obj_rot_mat = quat_to_matrix_xyzw(obj_root_rot)
+
+        if obj_link_filter is None:
+            obj_link_filter = set(self.link_pcs.keys())
+        else:
+            obj_link_filter = set(obj_link_filter)
+
+        all_obj_points_world = []
+        link_slices = []
+        cursor = 0
+        for link_name, local_points in self.link_pcs.items():
+            if link_name not in obj_link_filter:
+                continue
+            if link_name not in obj_ret:
+                continue
+
+            link_tf = obj_ret[link_name].get_matrix()
+            link_rot = link_tf[:, :3, :3]
+            link_trans = link_tf[:, :3, 3]
+            points_obj = (torch.matmul(local_points, link_rot.transpose(1, 2)) + link_trans.unsqueeze(1)) * self.obj_scale
+            points_world = torch.matmul(points_obj, obj_rot_mat.transpose(1, 2)) + obj_root_pos.unsqueeze(1)
+            all_obj_points_world.append(points_world)
+
+            n = int(points_world.shape[1])
+            link_slices.append((link_name, cursor, cursor + n))
+            cursor += n
+
+        if len(all_obj_points_world) == 0:
+            raise RuntimeError("No object surface points selected after filtering.")
+
+        return torch.cat(all_obj_points_world, dim=1), link_slices
+
     def compute_batch_contact(self, hand_root_pos, hand_root_rot, hand_qpos, 
                                     obj_root_pos, obj_root_rot, obj_qpos, thresh=0.015):
         """
         批量计算手与物体的接触标签 (所有输入均为 Tensor，支持 batch_size = B)
         """
         B = hand_qpos.shape[0]
-        
-        hand_dict = {name: hand_qpos[:, i] for i, name in enumerate(self.hand_joint_names)}
-        hand_ret = self.hand_chain.forward_kinematics(hand_dict)
-        hand_rot_mat = quat_to_matrix_xyzw(hand_root_rot) 
-        
-        hand_joints_world = []
-        for jname in self.finger_joints:
-            local_pos = hand_ret[jname].get_matrix()[:, :3, 3]
-            world_pos = torch.bmm(hand_rot_mat, local_pos.unsqueeze(-1)).squeeze(-1) + hand_root_pos
-            hand_joints_world.append(world_pos)
-        hand_joints_world = torch.stack(hand_joints_world, dim=1) 
-        
-        obj_dict = {name: obj_qpos[:, i] for i, name in enumerate(self.obj_joint_names)}
-        obj_ret = self.obj_chain.forward_kinematics(obj_dict)
-        obj_rot_mat = quat_to_matrix_xyzw(obj_root_rot)
-        
-        all_obj_points_world = []
-        for link_name, local_points in self.link_pcs.items():
-            if link_name in obj_ret:
-                link_tf = obj_ret[link_name].get_matrix()
-                link_rot = link_tf[:, :3, :3]
-                link_trans = link_tf[:, :3, 3]
-                points_obj = (torch.matmul(local_points, link_rot.transpose(1, 2)) + link_trans.unsqueeze(1)) * self.obj_scale
-                points_world = torch.matmul(points_obj, obj_rot_mat.transpose(1, 2)) + obj_root_pos.unsqueeze(1)
-                all_obj_points_world.append(points_world)
-            
-        merged_obj_points = torch.cat(all_obj_points_world, dim=1)
+
+        hand_joints_world, _ = self.compute_hand_joint_positions_world(
+            hand_root_pos, hand_root_rot, hand_qpos, joint_names=self.finger_joints
+        )
+        merged_obj_points, _ = self.compute_object_surface_points_world(
+            obj_root_pos, obj_root_rot, obj_qpos
+        )
         
         dists = torch.cdist(hand_joints_world, merged_obj_points)
         min_dists, _ = torch.min(dists, dim=2)

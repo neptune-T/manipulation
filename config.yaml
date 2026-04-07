@@ -150,8 +150,18 @@ asset:
     - [0.4, -0.6, 0.6]
   arti_position_noise: 0.1 # meter
   arti_rotation_noise: 15 # degree
-  arti_obj_scale: 0.4
+  arti_obj_scale: 0.6
   arti_rotation: -40
+
+  # MANO hand collision tuning for handle envelopment
+  mano_shape_contact_offset: 0.003
+  mano_shape_friction: 6.0
+  mano_shape_thickness: 0.006
+
+  # Articulated object collision tuning
+  arti_shape_contact_offset: 0.005
+  arti_shape_friction: 6.0
+  arti_shape_thickness: 0.015
 
   # table_pose_p: [0.4, 0, 0.5]
   # table_scale: [1.2, 2, 0.3]

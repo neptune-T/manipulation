@@ -144,19 +144,19 @@
 		<collision>
 			<origin xyz="-0.3222042194546104 -0.8713290095329285 -0.3357881237454305"/>
 			<geometry>
-				<mesh filename="textured_objs/original-12.obj"/>
+				<mesh filename="textured_objs/original-12.obj" scale="1.5 2.0 1.0"/>
 			</geometry>
 		</collision>
 		<collision>
 			<origin xyz="-0.3222042194546104 -0.8713290095329285 -0.3357881237454305"/>
 			<geometry>
-				<mesh filename="textured_objs/modified-0-original-14.obj"/>
+				<mesh filename="textured_objs/modified-0-original-14.obj" scale="1.5 2.0 1.0"/>
 			</geometry>
 		</collision>
 		<collision>
 			<origin xyz="-0.3222042194546104 -0.8713290095329285 -0.3357881237454305"/>
 			<geometry>
-				<mesh filename="textured_objs/modified-0-original-13.obj"/>
+				<mesh filename="textured_objs/modified-0-original-13.obj" scale="1.5 2.0 1.0"/>
 			</geometry>
 		</collision>
 	</link>
@@ -187,19 +187,19 @@
 		<collision>
 			<origin xyz="-0.3222042194546104 -0.8713290095329285 -0.3357881237454305"/>
 			<geometry>
-				<mesh filename="textured_objs/original-6.obj"/>
+				<mesh filename="textured_objs/original-6.obj" scale="1.5 2.0 1.0"/>
 			</geometry>
 		</collision>
 		<collision>
 			<origin xyz="-0.3222042194546104 -0.8713290095329285 -0.3357881237454305"/>
 			<geometry>
-				<mesh filename="textured_objs/modified-0-original-8.obj"/>
+				<mesh filename="textured_objs/modified-0-original-8.obj" scale="1.5 2.0 1.0"/>
 			</geometry>
 		</collision>
 		<collision>
 			<origin xyz="-0.3222042194546104 -0.8713290095329285 -0.3357881237454305"/>
 			<geometry>
-				<mesh filename="textured_objs/modified-0-original-7.obj"/>
+				<mesh filename="textured_objs/modified-0-original-7.obj" scale="1.5 2.0 1.0"/>
 			</geometry>
 		</collision>
 	</link>

@@ -255,7 +255,7 @@ class SingleDoorResidualConfig:
     max_episode_steps: int = 120
     action_repeat: int = 2
     settle_steps: int = 6
-    pregrasp_offset: float = 0.06
+    pregrasp_offset: float = 0.04
     trajectory_steps: int = 100
     max_open_amount: float = 1.2
     pos_action_scale: float = 0.015
@@ -277,16 +277,17 @@ class SingleDoorResidualConfig:
     curriculum_window: int = 20
     pinch_search_enabled: bool = True
     pinch_search_lateral_step: float = 0.008
-    pinch_search_depth_step: float = 0.0015
+    pinch_search_depth_step: float = 0.003
     pinch_search_lateral_trials: int = 5
     pinch_search_yaw_deg: float = 18.0
     pinch_search_roll_deg: float = 12.0
     wrist_rotation_lock: float = 0.85
     grasp_settle_steps: int = 6
     grasp_settle_synergy_scale: float = 0.65
-    max_safe_penetration: float = -0.0015
+    max_safe_penetration: float = -0.003
     door_plane_buffer: float = 0.003
     palm_safe_buffer: float = 0.005
+    handle_passthrough: bool = True
 
 
 class SingleDoorResidualEnv:
@@ -392,6 +393,7 @@ class SingleDoorResidualEnv:
         spawn_height = self._compute_object_spawn_height(cfgs["asset"]["arti_obj_scale"])
         cfgs["asset"]["arti_obj_pose_ps"] = [[0.8, 0.0, spawn_height]]
         cfgs["SAVE_ROOT"] = self.config.save_root
+        cfgs["asset"]["handle_passthrough"] = bool(self.config.handle_passthrough)
 
         if self.task_spec.joint_type in ["revolute", "continuous"]:
             cfgs["asset"]["arti_shape_contact_offset"] = 0.005
@@ -544,8 +546,8 @@ class SingleDoorResidualEnv:
                         target_qpos=target_qpos,
                         approach_dir=-world_geom["handle_out_world"],
                         obj_urdf_path=obj_urdf_path,
-                        surface_contact_thresh=0.015,
-                        min_contact_points=24,
+                        surface_contact_thresh=0.020,
+                        min_contact_points=20,
                         required_contact_links=["thumb3", "index3", "middle3"],
                         min_points_per_link=2,
                         settle_steps=10,
@@ -603,7 +605,7 @@ class SingleDoorResidualEnv:
     def get_handle_geometry_diagnostics(self) -> Dict[str, Any]:
         local_extent = np.asarray(self.task_spec.handle_extent_local, dtype=np.float32) * float(self.obj_scale)
         world_geom = self._current_world_geom()
-        return {
+        diag = {
             "handle_extent_world": _to_jsonable(local_extent),
             "handle_depth_world": float(local_extent[0]),
             "handle_length_world": float(local_extent[1]),
@@ -615,6 +617,14 @@ class SingleDoorResidualEnv:
             "hinge_origin_world": _to_jsonable(world_geom["hinge_origin_world"]),
             "hinge_axis_world": _to_jsonable(world_geom["hinge_axis_world"]),
         }
+        if self.npcs_handle_loc is not None:
+            diag["npcs_handle_link"] = self.npcs_handle_loc.handle_link_name
+            diag["npcs_handle_category"] = self.npcs_handle_loc.handle_category
+            diag["npcs_handle_num_points"] = int(self.npcs_handle_loc.handle_points_world.shape[0])
+            diag["npcs_handle_center"] = _to_jsonable(self.npcs_handle_loc.handle_center.cpu().numpy())
+            diag["npcs_handle_long_axis"] = _to_jsonable(self.npcs_handle_loc.handle_long_axis.cpu().numpy())
+            diag["npcs_handle_normal"] = _to_jsonable(self.npcs_handle_loc.handle_normal.cpu().numpy())
+        return diag
 
     def _compute_open_amount(self) -> float:
         open_amount = 1.0 if self.task_spec.joint_type in ["revolute", "continuous"] else 0.15
@@ -638,16 +648,50 @@ class SingleDoorResidualEnv:
 
         mano_urdf_path = os.path.join(self.repo_root, "urdf", "mano.urdf")
         obj_urdf_path = self.task_spec.urdf_path
-        handle_point_cloud = _build_handle_point_cloud_from_collision_mesh(
-            gym=self.gym,
-            obj_urdf_path=obj_urdf_path,
-            link_name=self.task_spec.handle_link_name,
-            handle_center=world_geom["handle_front_center_world"],
-            handle_out=world_geom["handle_out_world"],
-            num_points=1500,
-            points_per_link=2500,
-            backside_margin=None,
-        )
+
+        # --- NPCS-based handle localization (primary) ---
+        handle_point_cloud = None
+        self.npcs_handle_loc = None
+        try:
+            from npcs_handle_localization import localize_handle_from_annotations
+            npcs_loc = localize_handle_from_annotations(
+                asset_dir=self.asset_dir,
+                target_handle_link=self.task_spec.handle_link_name,
+                num_points=1500,
+                device=self.config.device,
+            )
+            if npcs_loc is not None and npcs_loc.handle_points_world.shape[0] > 0:
+                # Transform NPCS points to world frame (apply object pose)
+                obj_pos_t = torch.tensor(
+                    self.gym.arti_init_obj_pos_list[0], dtype=torch.float32,
+                    device=self.gym.device,
+                )
+                obj_rot_t = torch.tensor(
+                    self.gym.arti_init_obj_rot_list[0], dtype=torch.float32,
+                    device=self.gym.device,
+                )
+                from fast_contact_calc import quat_to_matrix_xyzw
+                obj_rot_mat = quat_to_matrix_xyzw(obj_rot_t.unsqueeze(0))
+                local_pts = npcs_loc.handle_points_world.to(self.gym.device) * self.obj_scale
+                handle_point_cloud = (local_pts @ obj_rot_mat.squeeze(0).T + obj_pos_t).detach()
+                self.npcs_handle_loc = npcs_loc
+                print(f"[NPCS] Handle localized via NPCS: {handle_point_cloud.shape[0]} pts, "
+                      f"link={npcs_loc.handle_link_name}, cat={npcs_loc.handle_category}")
+        except Exception as exc:
+            print(f"[NPCS] NPCS localization unavailable, falling back: {exc}")
+
+        # --- Collision-mesh fallback ---
+        if handle_point_cloud is None:
+            handle_point_cloud = _build_handle_point_cloud_from_collision_mesh(
+                gym=self.gym,
+                obj_urdf_path=obj_urdf_path,
+                link_name=self.task_spec.handle_link_name,
+                handle_center=world_geom["handle_front_center_world"],
+                handle_out=world_geom["handle_out_world"],
+                num_points=1500,
+                points_per_link=2500,
+                backside_margin=None,
+            )
         if handle_point_cloud is None:
             handle_point_cloud = self._sample_bbox_handle_pc(world_geom)
 
@@ -1044,6 +1088,12 @@ class SingleDoorResidualEnv:
             "progress": float(self.prev_state.progress),
             "surface_contact_count": int(self.prev_state.surface_contact_count),
             "surface_contact_stable": bool(self.prev_state.surface_contact_stable),
+            "surface_contact_min_dist": float(self.prev_state.surface_contact_min_dist),
+            "handle_min_dist": float(self.prev_state.handle_min_dist),
+            "non_interact_min_dist": float(self.prev_state.non_interact_min_dist),
+            "non_interact_penetration_depth": float(self.prev_state.non_interact_penetration_depth),
+            "handle_contact_ratio": float(self.prev_state.handle_contact_ratio),
+            "non_interact_near_ratio": float(self.prev_state.non_interact_near_ratio),
             "door_plane_violation": float(self._door_plane_violation(self.prev_state)),
             "contact_features": _to_jsonable(build_contact_feature_vector(self.prev_state.surface_contact_link_counts)),
             "contact_target": _to_jsonable(get_phase_contact_target(self.get_curriculum_phase())),
@@ -1148,6 +1198,12 @@ class SingleDoorResidualEnv:
             "drive_dof_vel": float(state.drive_dof_vel),
             "surface_contact_count": int(state.surface_contact_count),
             "surface_contact_stable": bool(state.surface_contact_stable),
+            "surface_contact_min_dist": float(state.surface_contact_min_dist),
+            "handle_min_dist": float(state.handle_min_dist),
+            "non_interact_min_dist": float(state.non_interact_min_dist),
+            "non_interact_penetration_depth": float(state.non_interact_penetration_depth),
+            "handle_contact_ratio": float(state.handle_contact_ratio),
+            "non_interact_near_ratio": float(state.non_interact_near_ratio),
             "door_plane_violation": float(self._door_plane_violation(state)),
             "surface_contact_link_counts": dict(state.surface_contact_link_counts),
             "pinch_debug": {

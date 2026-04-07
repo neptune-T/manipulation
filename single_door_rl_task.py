@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+import torch
 
 
 PHASE_TO_ID = {
@@ -58,6 +59,78 @@ def _read_json(path: str, default: Any) -> Any:
         return default
     with open(path, "r") as handle:
         return json.load(handle)
+
+
+def prepare_handle_passthrough_urdf(
+    asset_dir: str,
+    handle_categories: Sequence[str] = (
+        "line_fixed_handle",
+        "round_fixed_handle",
+        "hinge_knob",
+        "revolute_handle",
+    ),
+    src_urdf: str = "mobility_annotation_gapartnet.urdf",
+    dst_urdf: str = "mobility_annotation_gapartnet_passthrough.urdf",
+) -> str:
+    """Strip collision elements from handle links so MANO fingers can pass through.
+
+    Reads ``link_annotation_gapartnet.json`` to identify which links are handles,
+    then writes a modified copy of the URDF with those links' ``<collision>``
+    elements removed.  Visual geometry is kept so the handle remains visible.
+
+    Returns the absolute path of the generated URDF.  If the output already
+    exists and is newer than both the source URDF and the annotation file,
+    it is returned as-is (no rewrite).
+    """
+    urdf_path = os.path.join(asset_dir, src_urdf)
+    anno_path = os.path.join(asset_dir, "link_annotation_gapartnet.json")
+    dst_path = os.path.join(asset_dir, dst_urdf)
+
+    # Skip regeneration when output is up-to-date.
+    if os.path.exists(dst_path):
+        dst_mtime = os.path.getmtime(dst_path)
+        if (
+            os.path.getmtime(urdf_path) <= dst_mtime
+            and os.path.getmtime(anno_path) <= dst_mtime
+        ):
+            return dst_path
+
+    annos = _read_json(anno_path, [])
+    handle_link_names: set = set()
+    for anno in annos:
+        if not anno.get("is_gapart", False):
+            continue
+        cat = str(anno.get("category", "")).lower()
+        if cat in {c.lower() for c in handle_categories} or "handle" in cat or "knob" in cat:
+            link_name = anno.get("link_name")
+            if link_name:
+                handle_link_names.add(link_name)
+
+    tree = ET.parse(urdf_path)
+    root = tree.getroot()
+
+    stripped_count = 0
+    for link_elem in root.findall("link"):
+        if link_elem.get("name") not in handle_link_names:
+            continue
+        collisions = link_elem.findall("collision")
+        for col in collisions:
+            link_elem.remove(col)
+            stripped_count += 1
+
+    if stripped_count > 0:
+        tree.write(dst_path, xml_declaration=True)
+        print(
+            f"[handle-passthrough] Stripped {stripped_count} collision element(s) "
+            f"from handle links {handle_link_names} → {dst_path}"
+        )
+    else:
+        # No handle collision to strip — just copy the original.
+        import shutil
+        shutil.copy2(urdf_path, dst_path)
+        print(f"[handle-passthrough] No handle collisions found; copied URDF → {dst_path}")
+
+    return dst_path
 
 
 def parse_joint_info(urdf_path: str, target_link_name: str) -> Tuple[Optional[str], Optional[np.ndarray], Optional[np.ndarray], Optional[str], Optional[float], Optional[float]]:
@@ -194,6 +267,235 @@ def _find_handle_for_door(
     return None
 
 
+def _read_joints_from_urdf(urdf_path: str) -> Dict[str, Dict[str, Any]]:
+    """Read the full kinematic chain from URDF (mirrors the official GAPartNet read_joints_from_urdf_file)."""
+    tree = ET.parse(urdf_path)
+    root = tree.getroot()
+    joint_dict: Dict[str, Dict[str, Any]] = {}
+    for joint in root.findall("joint"):
+        joint_name = joint.get("name")
+        joint_type = joint.get("type")
+        if joint_name is None or joint_type is None:
+            continue
+        child_elem = joint.find("child")
+        parent_elem = joint.find("parent")
+        if child_elem is None or parent_elem is None:
+            continue
+        origin_elem = joint.find("origin")
+        xyz = [0.0, 0.0, 0.0]
+        rpy = [0.0, 0.0, 0.0]
+        if origin_elem is not None:
+            if origin_elem.get("xyz"):
+                xyz = [float(x) for x in origin_elem.get("xyz").split()]
+            if origin_elem.get("rpy"):
+                rpy = [float(x) for x in origin_elem.get("rpy").split()]
+        axis_val = None
+        if joint_type in ("prismatic", "revolute", "continuous"):
+            axis_elem = joint.find("axis")
+            if axis_elem is not None and axis_elem.get("xyz"):
+                axis_val = [float(x) for x in axis_elem.get("xyz").split()]
+            else:
+                axis_val = [1.0, 0.0, 0.0]
+        joint_dict[joint_name] = {
+            "type": joint_type,
+            "parent": parent_elem.get("link"),
+            "child": child_elem.get("link"),
+            "xyz": xyz,
+            "rpy": rpy,
+            "axis": axis_val,
+        }
+    return joint_dict
+
+
+def _walk_ancestors(link_name: str, joints_dict: Dict[str, Dict[str, Any]]) -> List[str]:
+    """Return list of ancestor link names from link_name up to the root."""
+    child_to_joint: Dict[str, str] = {}
+    for jname, jinfo in joints_dict.items():
+        child_to_joint[jinfo["child"]] = jname
+    ancestors: List[str] = []
+    cur = link_name
+    while cur in child_to_joint:
+        jname = child_to_joint[cur]
+        cur = joints_dict[jname]["parent"]
+        ancestors.append(cur)
+    return ancestors
+
+
+def _axangle_to_matrix(axis: np.ndarray, angle: float) -> np.ndarray:
+    """Axis-angle to 3x3 rotation matrix (Rodrigues). Pure numpy, no scipy."""
+    ax = np.asarray(axis, dtype=np.float64).ravel()
+    norm = float(np.linalg.norm(ax))
+    if norm < 1e-12:
+        return np.eye(3, dtype=np.float64)
+    ax = ax / norm
+    c = np.cos(angle)
+    s = np.sin(angle)
+    t = 1.0 - c
+    x, y, z = ax[0], ax[1], ax[2]
+    return np.array([
+        [t * x * x + c,     t * x * y - s * z, t * x * z + s * y],
+        [t * x * y + s * z, t * y * y + c,     t * y * z - s * x],
+        [t * x * z - s * y, t * y * z + s * x, t * z * z + c    ],
+    ], dtype=np.float64)
+
+
+def _transform_bbox_through_chain(
+    bbox: np.ndarray,
+    link_name: str,
+    joints_dict: Dict[str, Dict[str, Any]],
+    joint_qpos: Optional[Dict[str, float]] = None,
+    base_link_name: str = "base",
+) -> np.ndarray:
+    """Transform a bbox from link-local space to world space via forward kinematics.
+
+    Mirrors the official GAPartNet ``query_part_pose_from_joint_qpos`` but uses
+    pure numpy instead of SAPIEN so we can run inside Isaac Gym.
+    """
+    child_to_joint: Dict[str, str] = {}
+    for jname, jinfo in joints_dict.items():
+        child_to_joint[jinfo["child"]] = jname
+
+    # Build chain from link up to (but not including) the base joint
+    chain: List[str] = []
+    cur = link_name
+    while cur in child_to_joint:
+        jname = child_to_joint[cur]
+        chain.append(jname)
+        cur = joints_dict[jname]["parent"]
+
+    # Compute cumulative transforms for each joint origin+axis in world frame
+    # Walk the chain root→leaf, accumulating the FK transform
+    chain_reversed = list(reversed(chain))
+    cum_pos = np.zeros(3, dtype=np.float64)
+    cum_rot = np.eye(3, dtype=np.float64)
+    joint_world: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    for jname in chain_reversed:
+        jinfo = joints_dict[jname]
+        xyz = np.asarray(jinfo["xyz"], dtype=np.float64)
+        rpy = np.asarray(jinfo["rpy"], dtype=np.float64)
+        local_rot = R.from_euler("xyz", rpy).as_matrix()
+        cum_pos = cum_pos + cum_rot @ xyz
+        cum_rot = cum_rot @ local_rot
+        if jinfo["axis"] is not None:
+            world_axis = cum_rot @ np.asarray(jinfo["axis"], dtype=np.float64)
+            world_axis = world_axis / (np.linalg.norm(world_axis) + 1e-12)
+        else:
+            world_axis = np.array([0.0, 0.0, 1.0])
+        joint_world[jname] = (cum_pos.copy(), world_axis.copy())
+
+    # Apply joint transformations to bbox (walk from root to leaf, like the official algo)
+    pts = np.asarray(bbox, dtype=np.float64).reshape(-1, 3).copy()
+    if joint_qpos is None:
+        joint_qpos = {}
+    for jname in chain_reversed:
+        jinfo = joints_dict[jname]
+        jtype = jinfo["type"]
+        qval = float(joint_qpos.get(jname, 0.0))
+        if jtype == "fixed" or abs(qval) < 1e-12:
+            continue
+        origin, axis = joint_world[jname]
+        if jtype == "prismatic":
+            pts = pts + axis * qval
+        elif jtype in ("revolute", "continuous"):
+            rot_mat = _axangle_to_matrix(axis, qval)
+            pts = (pts - origin) @ rot_mat.T + origin
+
+    return pts.astype(np.float32)
+
+
+def _find_handle_for_door_chain(
+    door_link_name: str,
+    handle_annos: List[Tuple[int, int, Dict[str, Any]]],
+    urdf_path: str,
+) -> Optional[Tuple[int, int, Dict[str, Any]]]:
+    """Fallback: walk the full kinematic chain to match handles to doors.
+
+    Uses the official GAPartNet approach — a handle belongs to a door if the
+    door link appears anywhere in the handle's ancestor chain (not just as a
+    direct parent).
+    """
+    joints_dict = _read_joints_from_urdf(urdf_path)
+    chain_matches: List[Tuple[int, int, Dict[str, Any]]] = []
+    for handle_gapart_idx, handle_full_idx, handle_anno in handle_annos:
+        handle_link_name = handle_anno.get("link_name")
+        if handle_link_name is None:
+            continue
+        ancestors = _walk_ancestors(handle_link_name, joints_dict)
+        if door_link_name in ancestors:
+            chain_matches.append((handle_gapart_idx, handle_full_idx, handle_anno))
+    if chain_matches:
+        return sorted(chain_matches, key=lambda item: item[0])[0]
+    return None
+
+
+def _find_any_handle_by_proximity(
+    annos: List[Dict[str, Any]],
+    door_link_name: str,
+    urdf_path: str,
+) -> Optional[Tuple[int, int, Dict[str, Any]]]:
+    """Last-resort fallback: find the nearest handle annotation by bbox proximity to the door.
+
+    Uses GAPartNet's TARGET_GAPARTS categories to identify valid handles.
+    """
+    HANDLE_CATEGORIES = {"line_fixed_handle", "round_fixed_handle", "hinge_knob", "revolute_handle", "hinge_handle"}
+    joints_dict = _read_joints_from_urdf(urdf_path)
+
+    # Get the door bbox center as reference
+    door_center = None
+    for anno in annos:
+        if anno.get("link_name") == door_link_name and anno.get("bbox"):
+            door_bbox = np.asarray(anno["bbox"], dtype=np.float32).reshape(-1, 3)
+            door_center = np.mean(door_bbox, axis=0)
+            break
+    if door_center is None:
+        return None
+
+    best_dist = float("inf")
+    best_match = None
+    gapart_idx = -1
+    for anno_idx, anno in enumerate(annos):
+        if not anno.get("is_gapart", False):
+            continue
+        gapart_idx += 1
+        cat = str(anno.get("category", "")).lower()
+        if cat not in HANDLE_CATEGORIES and "handle" not in cat and "knob" not in cat:
+            continue
+        bbox = anno.get("bbox", [])
+        if len(bbox) != 8:
+            continue
+        handle_bbox = np.asarray(bbox, dtype=np.float32).reshape(8, 3)
+        handle_center = np.mean(handle_bbox, axis=0)
+        dist = float(np.linalg.norm(handle_center - door_center))
+        if dist < best_dist:
+            best_dist = dist
+            best_match = (gapart_idx, anno_idx, anno)
+    return best_match
+
+
+def _match_handle_to_door(
+    door_link_name: str,
+    handle_annos: List[Tuple[int, int, Dict[str, Any]]],
+    annos: List[Dict[str, Any]],
+    parent_map: Dict[str, Tuple[str, str]],
+    urdf_path: str,
+    door_joint_name: Optional[str],
+) -> Tuple[Optional[Tuple[int, int, Dict[str, Any]]], str]:
+    """Associate a handle with a door using progressively weaker GAPartNet-style heuristics."""
+    match = _find_handle_for_door(door_link_name, handle_annos, parent_map, urdf_path, door_joint_name)
+    if match is not None:
+        return match, "direct_parent_or_joint"
+
+    match = _find_handle_for_door_chain(door_link_name, handle_annos, urdf_path)
+    if match is not None:
+        return match, "ancestor_chain"
+
+    match = _find_any_handle_by_proximity(annos, door_link_name, urdf_path)
+    if match is not None:
+        return match, "bbox_proximity"
+
+    return None, "unmatched"
+
+
 def _determine_open_sign(joint_lower: Optional[float], joint_upper: Optional[float]) -> float:
     candidates: List[float] = []
     if joint_upper is not None:
@@ -219,6 +521,7 @@ class SingleDoorTaskSpec:
     handle_bbox_index: int
     door_category: str
     handle_category: str
+    handle_match_strategy: str
     joint_name: str
     joint_type: str
     joint_origin_local: np.ndarray
@@ -303,6 +606,16 @@ class SingleDoorRuntimeState:
     surface_contact_min_dist: float
     surface_contact_link_counts: Dict[str, int]
     surface_contact_stable: bool
+    handle_min_dist: float
+    non_interact_min_dist: float
+    non_interact_signed_min_dist: float
+    non_interact_penetration_depth: float
+    handle_attraction_score: float
+    non_interact_repulsion_penalty: float
+    handle_contact_ratio: float
+    non_interact_near_ratio: float
+    fingertip_handle_dists: np.ndarray
+    fingertip_non_interact_dists: np.ndarray
     hinge_origin_world: np.ndarray
     hinge_axis_world: np.ndarray
     handle_center_world: np.ndarray
@@ -318,7 +631,7 @@ class SingleDoorRewardConfig:
     reach_weight: float = 0.25
     align_weight: float = 0.10
     contact_weight: float = 0.8
-    opposition_weight: float = 1.2
+    opposition_weight: float = 1.8
     hold_weight: float = 0.8
     progress_weight: float = 8.0
     tangent_weight: float = 0.75
@@ -332,19 +645,125 @@ class SingleDoorRewardConfig:
     tangent_scale: float = 0.5
     pinch_gate_threshold: float = 0.35
     progress_gate_threshold: float = 0.55
-    force_closure_weight: float = 1.25
-    force_closure_gate_threshold: float = 0.30
+    force_closure_weight: float = 2.0
+    force_closure_gate_threshold: float = 0.20
     penetration_progress_penalty: float = 8.0
     palm_penetration_penalty: float = 10.0
-    fingertip_penetration_allowance: float = 0.0035
-    sdf_contact_weight: float = 0.8
+    fingertip_penetration_allowance: float = 0.005
+    sdf_contact_weight: float = 1.2
     sdf_penetration_weight: float = 1.2
-    sdf_target_margin: float = 0.002
-    sdf_far_margin: float = 0.015
+    sdf_target_margin: float = 0.003
+    sdf_far_margin: float = 0.020
     outside_grasp_bonus_gate: float = 0.45
     outside_grasp_penalty: float = 4.0
     panel_penetration_weight: float = 5.0
     panel_penetration_scale: float = 200.0
+    envelopment_weight: float = 1.5
+    part_handle_reward_weight: float = 1.2
+    part_non_interact_penalty_weight: float = 4.0
+    part_handle_margin: float = 0.02
+    part_non_interact_margin: float = 0.015
+
+
+def _compute_part_aware_runtime_metrics(
+    gym,
+    task_spec: SingleDoorTaskSpec,
+    env_i: int,
+    handle_margin: float = 0.02,
+    non_interact_margin: float = 0.015,
+) -> Dict[str, Any]:
+    default_fingertip = np.full((10,), 0.10, dtype=np.float32)
+    default_metrics = {
+        "handle_min_dist": 0.10,
+        "non_interact_min_dist": 0.10,
+        "non_interact_signed_min_dist": 0.10,
+        "non_interact_penetration_depth": 0.0,
+        "handle_attraction_score": 0.0,
+        "non_interact_repulsion_penalty": 0.0,
+        "handle_contact_ratio": 0.0,
+        "non_interact_near_ratio": 0.0,
+        "fingertip_handle_dists": default_fingertip,
+        "fingertip_non_interact_dists": default_fingertip.copy(),
+    }
+
+    if not hasattr(gym, "contact_calc"):
+        return default_metrics
+
+    cc = gym.contact_calc
+    handle_link_name = str(task_spec.handle_link_name)
+    handle_links = [handle_link_name] if handle_link_name in cc.link_pcs else []
+    non_interact_links = [name for name in cc.link_pcs.keys() if name != handle_link_name]
+
+    if len(handle_links) == 0:
+        return default_metrics
+
+    try:
+        hand_root_pos = gym.root_states[gym.mano_actor_idxs[env_i], :3].detach().to(dtype=torch.float32).unsqueeze(0)
+        hand_root_rot = gym.root_states[gym.mano_actor_idxs[env_i], 3:7].detach().to(dtype=torch.float32).unsqueeze(0)
+        hand_qpos = gym.dof_pos[env_i, : gym.mano_num_dofs, 0].detach().to(dtype=torch.float32).unsqueeze(0)
+        obj_root_pos = torch.tensor(gym.arti_init_obj_pos_list[env_i], dtype=torch.float32, device=gym.device).unsqueeze(0)
+        obj_root_rot = torch.tensor(gym.arti_init_obj_rot_list[env_i], dtype=torch.float32, device=gym.device).unsqueeze(0)
+        obj_qpos = gym.dof_pos[
+            env_i,
+            gym.mano_num_dofs : gym.mano_num_dofs + gym.arti_obj_num_dofs,
+            0,
+        ].detach().to(dtype=torch.float32).unsqueeze(0)
+
+        fingertip_world, fingertip_names = cc.compute_hand_joint_positions_world(
+            hand_root_pos, hand_root_rot, hand_qpos, joint_names=cc.finger_joints
+        )
+        handle_points_world, _ = cc.compute_object_surface_points_world(
+            obj_root_pos, obj_root_rot, obj_qpos, obj_link_filter=handle_links
+        )
+        handle_dists = torch.cdist(fingertip_world, handle_points_world).min(dim=-1).values.squeeze(0)
+
+        if len(non_interact_links) > 0:
+            non_interact_points_world, _ = cc.compute_object_surface_points_world(
+                obj_root_pos, obj_root_rot, obj_qpos, obj_link_filter=non_interact_links
+            )
+            non_interact_dists = torch.cdist(fingertip_world, non_interact_points_world).min(dim=-1).values.squeeze(0)
+            hand_surface_world, _ = cc._compute_hand_surface_points_world(hand_root_pos, hand_root_rot, hand_qpos)
+            non_interact_signed_dists, _, _ = cc.compute_batch_signed_distance(
+                hand_surface_world,
+                obj_root_pos,
+                obj_root_rot,
+                obj_qpos,
+                obj_link_filter=non_interact_links,
+            )
+            non_interact_signed_min = float(non_interact_signed_dists.min().item())
+        else:
+            non_interact_dists = torch.full_like(handle_dists, 0.10)
+            non_interact_signed_min = 0.10
+
+        handle_margin_t = float(handle_margin)
+        non_interact_margin_t = float(non_interact_margin)
+        handle_attraction_score = torch.exp(-torch.mean(torch.relu(handle_dists - handle_margin_t)))
+        non_interact_repulsion_penalty = torch.mean(torch.relu(non_interact_margin_t - non_interact_dists).pow(2))
+
+        handle_contact_ratio = torch.mean((handle_dists <= handle_margin_t).to(torch.float32))
+        non_interact_near_ratio = torch.mean((non_interact_dists <= non_interact_margin_t).to(torch.float32))
+
+        fingertip_handle_dists = handle_dists.detach().cpu().numpy().astype(np.float32)
+        fingertip_non_interact_dists = non_interact_dists.detach().cpu().numpy().astype(np.float32)
+        if fingertip_handle_dists.shape[0] < 10:
+            pad = 10 - fingertip_handle_dists.shape[0]
+            fingertip_handle_dists = np.pad(fingertip_handle_dists, (0, pad), constant_values=0.10)
+            fingertip_non_interact_dists = np.pad(fingertip_non_interact_dists, (0, pad), constant_values=0.10)
+
+        return {
+            "handle_min_dist": float(handle_dists.min().item()),
+            "non_interact_min_dist": float(non_interact_dists.min().item()),
+            "non_interact_signed_min_dist": float(non_interact_signed_min),
+            "non_interact_penetration_depth": float(max(0.0, -non_interact_signed_min)),
+            "handle_attraction_score": float(handle_attraction_score.item()),
+            "non_interact_repulsion_penalty": float(non_interact_repulsion_penalty.item()),
+            "handle_contact_ratio": float(handle_contact_ratio.item()),
+            "non_interact_near_ratio": float(non_interact_near_ratio.item()),
+            "fingertip_handle_dists": fingertip_handle_dists[:10],
+            "fingertip_non_interact_dists": fingertip_non_interact_dists[:10],
+        }
+    except Exception:
+        return default_metrics
 
 
 def select_single_door_task(asset_dir: str, door_index: int = 0, preferred_door_link: Optional[str] = None, preferred_handle_link: Optional[str] = None) -> SingleDoorTaskSpec:
@@ -373,6 +792,7 @@ def select_single_door_task(asset_dir: str, door_index: int = 0, preferred_door_
             door_annos.append((gapart_bbox_index, anno_index, anno))
 
     candidates: List[SingleDoorTaskSpec] = []
+    unmatched_doors: List[str] = []
     for door_bbox_index, door_anno_index, door_anno in door_annos:
         door_link_name = door_anno.get("link_name")
         if door_link_name is None:
@@ -384,8 +804,16 @@ def select_single_door_task(asset_dir: str, door_index: int = 0, preferred_door_
         if joint_type not in ["revolute", "continuous"]:
             continue
 
-        handle_match = _find_handle_for_door(door_link_name, handle_annos, parent_map, urdf_path, joint_name)
+        handle_match, handle_match_strategy = _match_handle_to_door(
+            door_link_name=door_link_name,
+            handle_annos=handle_annos,
+            annos=annos,
+            parent_map=parent_map,
+            urdf_path=urdf_path,
+            door_joint_name=joint_name,
+        )
         if handle_match is None:
+            unmatched_doors.append(str(door_link_name))
             continue
 
         handle_bbox_index, handle_anno_index, handle_anno = handle_match
@@ -417,6 +845,7 @@ def select_single_door_task(asset_dir: str, door_index: int = 0, preferred_door_
                 handle_bbox_index=int(handle_bbox_index),
                 door_category=str(door_anno.get("category", "")),
                 handle_category=str(handle_anno.get("category", "")),
+                handle_match_strategy=str(handle_match_strategy),
                 joint_name=str(joint_name),
                 joint_type=str(joint_type),
                 joint_origin_local=np.asarray(joint_origin_local, dtype=np.float32),
@@ -436,7 +865,10 @@ def select_single_door_task(asset_dir: str, door_index: int = 0, preferred_door_
         )
 
     if not candidates:
-        raise RuntimeError(f"No single-door revolute task candidate found under {asset_dir}")
+        raise RuntimeError(
+            "No single-door revolute task candidate found under "
+            f"{asset_dir} (doors={len(door_annos)} handles={len(handle_annos)} unmatched_doors={unmatched_doors})"
+        )
 
     candidates = sorted(candidates, key=lambda item: (item.door_bbox_index, item.handle_bbox_index))
     selected_index = int(np.clip(door_index, 0, len(candidates) - 1))
@@ -473,11 +905,15 @@ def compute_force_closure_score(
     index = _clip_unit(link_counts.get("index3", 0) / float(target_points))
     middle = _clip_unit(link_counts.get("middle3", 0) / float(target_points))
     ring = _clip_unit(link_counts.get("ring3", 0) / float(target_points))
+    pinky = _clip_unit(link_counts.get("pinky3", 0) / float(target_points))
     finger_wall = max(index, middle, ring)
-    finger_support = _clip_unit((index + middle + ring) / 2.0)
+    finger_support = _clip_unit((index + middle + ring + pinky) / 2.5)
     closure_contact = min(thumb, finger_wall)
+    # Breadth bonus: reward having multiple fingers engaged rather than just one strong contact
+    engaged_fingers = sum(1.0 for f in [index, middle, ring, pinky] if f > 0.15)
+    breadth_bonus = _clip_unit(engaged_fingers / 3.0)
     alignment_term = _clip_unit(0.65 * handle_out_alignment + 0.35 * tangent_alignment)
-    return float(closure_contact * (0.55 + 0.45 * finger_support) * alignment_term)
+    return float(closure_contact * (0.45 + 0.35 * finger_support + 0.20 * breadth_bonus) * alignment_term)
 
 
 def compute_sdf_contact_score(min_dist: float, target_margin: float = 0.002, far_margin: float = 0.015) -> float:
@@ -490,6 +926,23 @@ def compute_sdf_contact_score(min_dist: float, target_margin: float = 0.002, far
     if min_dist >= far_margin:
         return 0.0
     return float(1.0 - (min_dist - target_margin) / max(far_margin - target_margin, 1e-6))
+
+
+def compute_envelopment_score(link_counts: Dict[str, int], target_points: int = 6) -> float:
+    """Reward full hand envelopment: bonus when all five fingers + palm wrap around the handle."""
+    thumb = _clip_unit(link_counts.get("thumb3", 0) / float(target_points))
+    index = _clip_unit(link_counts.get("index3", 0) / float(target_points))
+    middle = _clip_unit(link_counts.get("middle3", 0) / float(target_points))
+    ring = _clip_unit(link_counts.get("ring3", 0) / float(target_points))
+    pinky = _clip_unit(link_counts.get("pinky3", 0) / float(target_points))
+    # Geometric mean rewards having all fingers in contact rather than
+    # a few fingers with many points.  A single missing finger zeroes
+    # out the score, strongly encouraging full wrap-around.
+    contacts = [thumb, index, middle, ring, pinky]
+    min_contact = min(contacts)
+    mean_contact = float(np.mean(contacts))
+    # Blend: mostly driven by the weakest link (min) with a mean bonus
+    return float(0.7 * min_contact + 0.3 * mean_contact)
 
 
 def compute_outside_grasp_score(
@@ -638,6 +1091,8 @@ def extract_single_door_runtime_state(
     surface_contact_thresh: float = 0.015,
     min_contact_points: int = 30,
     contact_target_points: int = 6,
+    part_handle_margin: float = 0.02,
+    part_non_interact_margin: float = 0.015,
 ) -> SingleDoorRuntimeState:
     if hasattr(gym, "_ensure_contact_calc"):
         gym._ensure_contact_calc(obj_urdf_path=task_spec.urdf_path)
@@ -676,6 +1131,13 @@ def extract_single_door_runtime_state(
     obj_world_rot = gym.arti_init_obj_rot_list[env_i]
     obj_scale = gym.cfgs.get("asset", {}).get("arti_obj_scale", 1.0)
     world_geom = task_spec.world_geometry(obj_world_pos=obj_world_pos, obj_world_rot=obj_world_rot, obj_scale=obj_scale)
+    part_metrics = _compute_part_aware_runtime_metrics(
+        gym=gym,
+        task_spec=task_spec,
+        env_i=env_i,
+        handle_margin=part_handle_margin,
+        non_interact_margin=part_non_interact_margin,
+    )
 
     return SingleDoorRuntimeState(
         hand_pos=hand_pos,
@@ -694,6 +1156,16 @@ def extract_single_door_runtime_state(
         surface_contact_min_dist=float(min_dist),
         surface_contact_link_counts={str(k): int(v) for k, v in link_counts.items()},
         surface_contact_stable=stable_contact,
+        handle_min_dist=float(part_metrics["handle_min_dist"]),
+        non_interact_min_dist=float(part_metrics["non_interact_min_dist"]),
+        non_interact_signed_min_dist=float(part_metrics["non_interact_signed_min_dist"]),
+        non_interact_penetration_depth=float(part_metrics["non_interact_penetration_depth"]),
+        handle_attraction_score=float(part_metrics["handle_attraction_score"]),
+        non_interact_repulsion_penalty=float(part_metrics["non_interact_repulsion_penalty"]),
+        handle_contact_ratio=float(part_metrics["handle_contact_ratio"]),
+        non_interact_near_ratio=float(part_metrics["non_interact_near_ratio"]),
+        fingertip_handle_dists=np.asarray(part_metrics["fingertip_handle_dists"], dtype=np.float32),
+        fingertip_non_interact_dists=np.asarray(part_metrics["fingertip_non_interact_dists"], dtype=np.float32),
         hinge_origin_world=world_geom["hinge_origin_world"],
         hinge_axis_world=world_geom["hinge_axis_world"],
         handle_center_world=world_geom["handle_center_world"],
@@ -744,8 +1216,23 @@ def build_single_door_observation(state: SingleDoorRuntimeState, prev_action: Op
             float(state.drive_dof_vel),
             float(state.surface_contact_count) / 100.0,
             float(state.surface_contact_min_dist),
+            float(state.handle_min_dist),
+            float(state.non_interact_min_dist),
+            float(state.non_interact_signed_min_dist),
+            float(state.non_interact_penetration_depth),
+            float(state.handle_attraction_score),
+            float(state.non_interact_repulsion_penalty),
+            float(state.handle_contact_ratio),
+            float(state.non_interact_near_ratio),
         ],
         dtype=np.float32,
+    )
+    part_feats = np.concatenate(
+        [
+            np.asarray(state.fingertip_handle_dists, dtype=np.float32).reshape(-1),
+            np.asarray(state.fingertip_non_interact_dists, dtype=np.float32).reshape(-1),
+        ],
+        axis=0,
     )
 
     prev_action_arr = np.zeros(0, dtype=np.float32) if prev_action is None else np.asarray(prev_action, dtype=np.float32).reshape(-1)
@@ -759,6 +1246,7 @@ def build_single_door_observation(state: SingleDoorRuntimeState, prev_action: Op
             rel_rot_6d.astype(np.float32),
             obj_feats,
             contact_feats,
+            part_feats,
             prev_action_arr,
         ],
         axis=0,
@@ -814,6 +1302,10 @@ def compute_single_door_reward(
         target_margin=cfg.sdf_target_margin,
         far_margin=cfg.sdf_far_margin,
     )
+    envelopment_reward = compute_envelopment_score(
+        state.surface_contact_link_counts,
+        target_points=cfg.contact_target_points,
+    )
     outside_grasp_score = compute_outside_grasp_score(
         state.surface_contact_link_counts,
         force_closure_reward=force_closure_reward,
@@ -823,6 +1315,10 @@ def compute_single_door_reward(
         (force_closure_reward - cfg.force_closure_gate_threshold) / max(1e-6, 1.0 - cfg.force_closure_gate_threshold)
     )
     hold_reward = float((0.5 * opposition_reward + 0.5 * pinch_reward) if state.surface_contact_stable else 0.0)
+    part_handle_reward = float(state.handle_attraction_score * (0.25 + 0.75 * pinch_gate))
+    part_non_interact_penalty = float(
+        state.non_interact_repulsion_penalty + 2.0 * state.non_interact_penetration_depth
+    )
 
     progress_delta = 0.0 if prev_state is None else float(state.progress - prev_state.progress)
     progress_gate = _clip_unit(
@@ -839,6 +1335,8 @@ def compute_single_door_reward(
     if prev_state is not None and prev_state.surface_contact_stable and not state.surface_contact_stable:
         detach_penalty = 1.0
     if pinch_reward < 0.15 and reach_dist < 0.05:
+        detach_penalty += 0.5
+    if state.handle_min_dist > float(cfg.part_handle_margin) and state.non_interact_near_ratio > 0.25:
         detach_penalty += 0.5
     # --- Penetration penalties (surface_contact_min_dist < 0 means inside object) ---
     penetration_depth = float(max(0.0, -state.surface_contact_min_dist))
@@ -889,7 +1387,9 @@ def compute_single_door_reward(
         + cfg.sdf_contact_weight * sdf_contact_reward
         + cfg.opposition_weight * opposition_reward
         + cfg.force_closure_weight * force_closure_reward
+        + cfg.envelopment_weight * envelopment_reward
         + cfg.hold_weight * hold_reward
+        + cfg.part_handle_reward_weight * part_handle_reward
         + 0.75 * pinch_reward
         + cfg.progress_weight * progress_reward
         + cfg.tangent_weight * tangent_reward
@@ -898,6 +1398,7 @@ def compute_single_door_reward(
         - cfg.sdf_penetration_weight * sdf_penetration_penalty
         - cfg.panel_penetration_weight * panel_penetration_penalty
         - cfg.palm_penetration_penalty * palm_penalty
+        - cfg.part_non_interact_penalty_weight * part_non_interact_penalty
         - (0.0 if outside_grasp_ok else cfg.outside_grasp_penalty * max(0.0, state.progress))
         - cfg.action_l2_weight * action_l2
         - cfg.action_smooth_weight * action_smooth
@@ -915,9 +1416,17 @@ def compute_single_door_reward(
         "opposition": float(opposition_reward),
         "force_closure": float(force_closure_reward),
         "force_closure_gate": float(force_closure_gate),
+        "envelopment": float(envelopment_reward),
         "outside_grasp": float(outside_grasp_score),
         "outside_grasp_ok": float(outside_grasp_ok),
         "hold": float(hold_reward),
+        "part_handle": float(part_handle_reward),
+        "part_non_interact_penalty": float(part_non_interact_penalty),
+        "handle_min_dist": float(state.handle_min_dist),
+        "non_interact_min_dist": float(state.non_interact_min_dist),
+        "non_interact_penetration_depth": float(state.non_interact_penetration_depth),
+        "handle_contact_ratio": float(state.handle_contact_ratio),
+        "non_interact_near_ratio": float(state.non_interact_near_ratio),
         "pinch": float(pinch_reward),
         "pinch_gate": float(pinch_gate),
         "progress_gate": float(progress_gate),

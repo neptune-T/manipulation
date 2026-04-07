@@ -119,7 +119,7 @@ class ManoChamferSDFOptimizer(nn.Module):
         thumb_tip = tips_tensor[4]
         proj_thumb = torch.sum((thumb_tip - h_center) * h_out, dim=-1)
 
-        side_margin = 0.003  # 3mm：留出稳定接触的“夹持间隙”
+        side_margin = 0.005  # 5mm：留出稳定接触的”夹持间隙”
         # 四指如果跑到中平面前侧 -> 惩罚
         loss_fingers_side = torch.sum(torch.relu(proj_tips - (mid_proj - side_margin)))
         # 拇指如果没到中平面前侧 -> 惩罚
@@ -131,7 +131,7 @@ class ManoChamferSDFOptimizer(nn.Module):
             torch.abs(proj_mids - desired_back)
         )
 
-        deep_hook_margin = 0.006
+        deep_hook_margin = 0.010
         loss_anti_hook = torch.sum(torch.relu((min_proj - deep_hook_margin) - proj_tips))
 
         # ----------------------------------------------------
@@ -184,7 +184,7 @@ class ManoChamferSDFOptimizer(nn.Module):
 
         # 4) 夹持宽度要接近把手厚度，不要过大或过小
         closure_width = torch.abs(torch.sum(closure_vec * h_out))
-        target_width = 0.80 * (max_proj - min_proj + 1e-6)
+        target_width = 0.90 * (max_proj - min_proj + 1e-6)
         loss_closure_width = torch.abs(closure_width - target_width)
 
         loss_force_closure = (
@@ -213,7 +213,7 @@ class ManoChamferSDFOptimizer(nn.Module):
         loss_closure = torch.sum(torch.relu(closure_target - q_flexion))
 
         # 5. 锚定与旋转死锁
-        target_palm_pos = h_center + h_out * 0.06
+        target_palm_pos = h_center + h_out * 0.03
         loss_anchor = torch.norm(self.palm_pos - target_palm_pos)
         norm_rot = self.palm_rot / (torch.norm(self.palm_rot) + 1e-6)
         init_rot = self.init_palm_rot / (torch.norm(self.init_palm_rot) + 1e-6)

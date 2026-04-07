@@ -324,7 +324,7 @@
 		<collision>
 			<origin xyz="-0.30885392120163124 -0.87123 -0.26578184550122397"/>
 			<geometry>
-				<mesh filename="textured_objs/original-2.obj"/>
+				<mesh filename="textured_objs/original-2.obj" scale="1.5 2.0 1.0"/>
 			</geometry>
 		</collision>
 	</link>
@@ -343,7 +343,7 @@
 		<collision>
 			<origin xyz="-0.30885392120163124 -0.87123 -0.26578184550122397"/>
 			<geometry>
-				<mesh filename="textured_objs/original-17.obj"/>
+				<mesh filename="textured_objs/original-17.obj" scale="1.5 2.0 1.0"/>
 			</geometry>
 		</collision>
 	</link>
