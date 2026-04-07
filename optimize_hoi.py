@@ -199,6 +199,19 @@ class ManoChamferSDFOptimizer(nn.Module):
         dists_mids = torch.cdist(mids_tensor, pc_tensor)
         loss_chamfer = torch.mean(torch.min(dists_tips, dim=1)[0]) + 0.3 * torch.mean(torch.min(dists_mids, dim=1)[0])
 
+        # ----------------------------------------------------
+        # 🌟 Per-finger contact loss: each fingertip must be within
+        # a tight threshold of the handle surface.  Unlike chamfer
+        # (which averages), this penalises *every* finger that drifts.
+        # ----------------------------------------------------
+        contact_threshold = 0.008  # 8 mm — tighter than chamfer alone
+        per_tip_min_dist = torch.min(dists_tips, dim=1)[0]          # (5,)
+        per_mid_min_dist = torch.min(dists_mids, dim=1)[0]          # (5,)
+        # Penalise distance beyond threshold for each finger
+        loss_tip_contact = torch.sum(torch.relu(per_tip_min_dist - contact_threshold))
+        loss_mid_contact = torch.sum(torch.relu(per_mid_min_dist - contact_threshold * 2.0))
+        loss_contact = loss_tip_contact + 0.5 * loss_mid_contact
+
         door_plane_point = h_center + h_out * (min_proj - 0.0015)
         all_joints = torch.cat([self.palm_pos.unsqueeze(0), mids_tensor, tips_tensor], dim=0)
         signed_dists = torch.sum((all_joints - door_plane_point) * h_out, dim=-1)
@@ -213,7 +226,10 @@ class ManoChamferSDFOptimizer(nn.Module):
         loss_closure = torch.sum(torch.relu(closure_target - q_flexion))
 
         # 5. 锚定与旋转死锁
-        target_palm_pos = h_center + h_out * 0.03
+        # Anchor offset proportional to handle thickness instead of fixed 3cm
+        handle_thickness = max_proj - min_proj + 1e-6
+        anchor_offset = torch.clamp(handle_thickness * 0.4, min=0.005, max=0.025)
+        target_palm_pos = h_center + h_out * anchor_offset
         loss_anchor = torch.norm(self.palm_pos - target_palm_pos)
         norm_rot = self.palm_rot / (torch.norm(self.palm_rot) + 1e-6)
         init_rot = self.init_palm_rot / (torch.norm(self.init_palm_rot) + 1e-6)
@@ -230,8 +246,13 @@ class ManoChamferSDFOptimizer(nn.Module):
         weight_thumb_dir = 20.0 * (1.0 - alpha) + 120.0 * alpha
         weight_centerline = 20.0 * (1.0 - alpha) + 70.0 * alpha
         weight_force_closure = 60.0 * (1.0 - alpha) + 180.0 * alpha
+        # Contact: ramp up aggressively — early stages need fingers close,
+        # late stages enforce tight surface contact
+        weight_chamfer = 40.0 * (1.0 - alpha) + 120.0 * alpha
+        weight_contact = 80.0 * (1.0 - alpha) + 300.0 * alpha
 
-        total_loss = 40.0 * loss_chamfer + \
+        total_loss = weight_chamfer * loss_chamfer + \
+                     weight_contact * loss_contact + \
                      weight_back_surface * loss_back_surface + \
                      weight_anti_hook * loss_anti_hook + \
                      weight_opposition * loss_opposition + \
@@ -250,7 +271,7 @@ class ManoChamferSDFOptimizer(nn.Module):
         return total_loss, self.palm_pos, valid_quat, self.qpos
     
 def run_optimization(mano_urdf_path, init_p, init_q, handle_pc, handle_center, handle_out, handle_long):
-    print("🚀 开始基于 pinch + force-closure 几何先验的抓取优化...")
+    print(" 开始基于 pinch + force-closure 几何先验的抓取优化...")
     model = ManoChamferSDFOptimizer(mano_urdf_path, init_p, init_q).cuda()
     optimizer = optim.Adam(model.parameters(), lr=0.005) 
     

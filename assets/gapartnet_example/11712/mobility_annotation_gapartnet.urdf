@@ -122,12 +122,12 @@
 		<child link="link_2"/>
 		<parent link="base"/>
 	</joint>
-	<link name="link_3">
-		<visual name="handle-1">
-			<origin xyz="-0.3222042194546104 -0.8713290095329285 -0.3357881237454305"/>
-			<geometry>
-				<mesh filename="textured_objs/original-12.obj"/>
-			</geometry>
+		<link name="link_3">
+			<visual name="handle-1">
+				<origin xyz="-0.3222042194546104 -0.8713290095329285 -0.3357881237454305"/>
+				<geometry>
+					<mesh filename="textured_objs/original-12.obj"/>
+				</geometry>
 		</visual>
 		<visual name="handle-1">
 			<origin xyz="-0.3222042194546104 -0.8713290095329285 -0.3357881237454305"/>
@@ -141,11 +141,11 @@
 				<mesh filename="textured_objs/modified-0-original-13.obj"/>
 			</geometry>
 		</visual>
-		<collision>
-			<origin xyz="-0.3222042194546104 -0.8713290095329285 -0.3357881237454305"/>
-			<geometry>
-				<mesh filename="textured_objs/original-12.obj" scale="1.5 2.0 1.0"/>
-			</geometry>
+			<collision>
+				<origin xyz="-0.3222042194546104 -0.8713290095329285 -0.3357881237454305"/>
+				<geometry>
+					<mesh filename="textured_objs/original-12.obj" scale="1.5 2.0 1.0"/>
+				</geometry>
 		</collision>
 		<collision>
 			<origin xyz="-0.3222042194546104 -0.8713290095329285 -0.3357881237454305"/>
@@ -160,17 +160,17 @@
 			</geometry>
 		</collision>
 	</link>
-	<joint name="joint_3" type="fixed">
-		<origin rpy="0 0 0" xyz="0 0 0"/>
-		<child link="link_3"/>
-		<parent link="link_0"/>
-	</joint>
-	<link name="link_4">
-		<visual name="handle-1">
-			<origin xyz="-0.3222042194546104 -0.8713290095329285 -0.3357881237454305"/>
-			<geometry>
-				<mesh filename="textured_objs/original-6.obj"/>
-			</geometry>
+		<joint name="joint_3" type="fixed">
+			<origin rpy="0 0 0" xyz="0 0 0"/>
+			<child link="link_3"/>
+			<parent link="link_0"/>
+		</joint>
+		<link name="link_4">
+			<visual name="handle-1">
+				<origin xyz="-0.3222042194546104 -0.8713290095329285 -0.3357881237454305"/>
+				<geometry>
+					<mesh filename="textured_objs/original-6.obj"/>
+				</geometry>
 		</visual>
 		<visual name="handle-1">
 			<origin xyz="-0.3222042194546104 -0.8713290095329285 -0.3357881237454305"/>
@@ -184,11 +184,11 @@
 				<mesh filename="textured_objs/modified-0-original-7.obj"/>
 			</geometry>
 		</visual>
-		<collision>
-			<origin xyz="-0.3222042194546104 -0.8713290095329285 -0.3357881237454305"/>
-			<geometry>
-				<mesh filename="textured_objs/original-6.obj" scale="1.5 2.0 1.0"/>
-			</geometry>
+			<collision>
+				<origin xyz="-0.3222042194546104 -0.8713290095329285 -0.3357881237454305"/>
+				<geometry>
+					<mesh filename="textured_objs/original-6.obj" scale="1.5 2.0 1.0"/>
+				</geometry>
 		</collision>
 		<collision>
 			<origin xyz="-0.3222042194546104 -0.8713290095329285 -0.3357881237454305"/>
@@ -203,9 +203,9 @@
 			</geometry>
 		</collision>
 	</link>
-	<joint name="joint_4" type="fixed">
-		<origin rpy="0 0 0" xyz="0 0 0"/>
-		<child link="link_4"/>
-		<parent link="link_1"/>
-	</joint>
+		<joint name="joint_4" type="fixed">
+			<origin rpy="0 0 0" xyz="0 0 0"/>
+			<child link="link_4"/>
+			<parent link="link_1"/>
+		</joint>
 </robot>

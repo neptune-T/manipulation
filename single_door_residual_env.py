@@ -649,51 +649,55 @@ class SingleDoorResidualEnv:
         mano_urdf_path = os.path.join(self.repo_root, "urdf", "mano.urdf")
         obj_urdf_path = self.task_spec.urdf_path
 
-        # --- NPCS-based handle localization (primary) ---
+        # --- Collision-mesh handle PC (primary — actual mesh surface) ---
         handle_point_cloud = None
         self.npcs_handle_loc = None
-        try:
-            from npcs_handle_localization import localize_handle_from_annotations
-            npcs_loc = localize_handle_from_annotations(
-                asset_dir=self.asset_dir,
-                target_handle_link=self.task_spec.handle_link_name,
-                num_points=1500,
-                device=self.config.device,
-            )
-            if npcs_loc is not None and npcs_loc.handle_points_world.shape[0] > 0:
-                # Transform NPCS points to world frame (apply object pose)
-                obj_pos_t = torch.tensor(
-                    self.gym.arti_init_obj_pos_list[0], dtype=torch.float32,
-                    device=self.gym.device,
-                )
-                obj_rot_t = torch.tensor(
-                    self.gym.arti_init_obj_rot_list[0], dtype=torch.float32,
-                    device=self.gym.device,
-                )
-                from fast_contact_calc import quat_to_matrix_xyzw
-                obj_rot_mat = quat_to_matrix_xyzw(obj_rot_t.unsqueeze(0))
-                local_pts = npcs_loc.handle_points_world.to(self.gym.device) * self.obj_scale
-                handle_point_cloud = (local_pts @ obj_rot_mat.squeeze(0).T + obj_pos_t).detach()
-                self.npcs_handle_loc = npcs_loc
-                print(f"[NPCS] Handle localized via NPCS: {handle_point_cloud.shape[0]} pts, "
-                      f"link={npcs_loc.handle_link_name}, cat={npcs_loc.handle_category}")
-        except Exception as exc:
-            print(f"[NPCS] NPCS localization unavailable, falling back: {exc}")
+        handle_point_cloud = _build_handle_point_cloud_from_collision_mesh(
+            gym=self.gym,
+            obj_urdf_path=obj_urdf_path,
+            link_name=self.task_spec.handle_link_name,
+            handle_center=world_geom["handle_front_center_world"],
+            handle_out=world_geom["handle_out_world"],
+            num_points=1500,
+            points_per_link=2500,
+            backside_margin=None,
+        )
+        if handle_point_cloud is not None:
+            print(f"[HandlePC] Collision mesh: {handle_point_cloud.shape[0]} pts")
 
-        # --- Collision-mesh fallback ---
+        # --- NPCS-based fallback (bbox surface approximation) ---
         if handle_point_cloud is None:
-            handle_point_cloud = _build_handle_point_cloud_from_collision_mesh(
-                gym=self.gym,
-                obj_urdf_path=obj_urdf_path,
-                link_name=self.task_spec.handle_link_name,
-                handle_center=world_geom["handle_front_center_world"],
-                handle_out=world_geom["handle_out_world"],
-                num_points=1500,
-                points_per_link=2500,
-                backside_margin=None,
-            )
+            try:
+                from npcs_handle_localization import localize_handle_from_annotations
+                npcs_loc = localize_handle_from_annotations(
+                    asset_dir=self.asset_dir,
+                    target_handle_link=self.task_spec.handle_link_name,
+                    num_points=1500,
+                    device=self.config.device,
+                )
+                if npcs_loc is not None and npcs_loc.handle_points_world.shape[0] > 0:
+                    obj_pos_t = torch.tensor(
+                        self.gym.arti_init_obj_pos_list[0], dtype=torch.float32,
+                        device=self.gym.device,
+                    )
+                    obj_rot_t = torch.tensor(
+                        self.gym.arti_init_obj_rot_list[0], dtype=torch.float32,
+                        device=self.gym.device,
+                    )
+                    from fast_contact_calc import quat_to_matrix_xyzw
+                    obj_rot_mat = quat_to_matrix_xyzw(obj_rot_t.unsqueeze(0))
+                    local_pts = npcs_loc.handle_points_world.to(self.gym.device) * self.obj_scale
+                    handle_point_cloud = (local_pts @ obj_rot_mat.squeeze(0).T + obj_pos_t).detach()
+                    self.npcs_handle_loc = npcs_loc
+                    print(f"[HandlePC] NPCS fallback: {handle_point_cloud.shape[0]} pts, "
+                          f"link={npcs_loc.handle_link_name}, cat={npcs_loc.handle_category}")
+            except Exception as exc:
+                print(f"[HandlePC] NPCS localization unavailable: {exc}")
+
+        # --- Bbox sampling last resort ---
         if handle_point_cloud is None:
             handle_point_cloud = self._sample_bbox_handle_pc(world_geom)
+            print(f"[HandlePC] Bbox fallback: {handle_point_cloud.shape[0]} pts")
 
         if self.config.use_optimized_grasp:
             opt_pos, opt_rot, opt_qpos = run_optimization(

@@ -1,0 +1,3 @@
+link_0 hinge door
+link_1 heavy furniture_body
+link_2 fixed handle

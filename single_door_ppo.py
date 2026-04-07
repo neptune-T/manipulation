@@ -137,7 +137,7 @@ def _to_jsonable(value):
 
 def main():
     parser = argparse.ArgumentParser(description="Train PPO on the single-door residual task.")
-    parser.add_argument("--asset-dir", type=str, default=os.path.join(os.path.dirname(__file__), "assets", "gapartnet_example", "11712"))
+    parser.add_argument("--asset-dir", type=str, default=os.path.join(os.path.dirname(__file__), "assets", "gapartnet_example", "45936"))
     parser.add_argument("--config", type=str, default="config.yaml")
     parser.add_argument("--door-index", type=int, default=0)
     parser.add_argument("--num-envs", type=int, default=1)
