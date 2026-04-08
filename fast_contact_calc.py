@@ -80,10 +80,24 @@ class FastContactCalculator:
                                     mesh = trimesh.util.concatenate(geom_list)
                             
                             if hasattr(mesh, 'vertices') and len(mesh.vertices) > 0:
+                                # 修复法线方向: GAPartNet mesh 通常是非水密的,
+                                # 法线朝向不一致会导致 SDF 符号翻转
+                                try:
+                                    trimesh.repair.fix_normals(mesh)
+                                except Exception:
+                                    pass
                                 # 采样点云
                                 pts, face_idx = trimesh.sample.sample_surface(mesh, points_per_link)
                                 face_normals = mesh.face_normals[face_idx]
-                                
+
+                                # 质心启发式: 确保法线朝外 (远离质心方向)
+                                centroid = mesh.vertices.mean(axis=0)
+                                to_centroid = centroid - pts
+                                dots = np.sum(face_normals * to_centroid, axis=1)
+                                # 如果大多数法线朝内 (>60%), 整体翻转
+                                if np.mean(dots > 0) > 0.6:
+                                    face_normals = -face_normals
+
                                 # 处理 collision 标签自带的 origin 偏移
                                 origin = collision.find('origin')
                                 if origin is not None:
@@ -95,7 +109,7 @@ class FastContactCalculator:
                                     
                                 link_points.append(pts)
                                 link_normals.append(face_normals)
-                                
+
             # 如果这个 link 存在任何碰撞模型，就合并并送入 GPU
             if len(link_points) > 0:
                 combined_pts = np.concatenate(link_points, axis=0)
@@ -103,11 +117,18 @@ class FastContactCalculator:
                 combined_normals = np.concatenate(link_normals, axis=0)
                 self.link_normals[link_name] = torch.tensor(combined_normals, dtype=torch.float32, device=device).unsqueeze(0)
 
-        # 4. 同样为 MANO 手加载碰撞 mesh 点云（用于“手部顶点/表面->物体表面”的距离接触判定）
+        # 4. 同样为 MANO 手加载碰撞 mesh 点云（用于"手部顶点/表面->物体表面"的距离接触判定）
         self.hand_link_pcs = {}
         self.hand_link_order = []
         if hand_contact_links is None:
-            hand_contact_links = ["palm", "index3", "middle3", "ring3", "pinky3", "thumb3"]
+            hand_contact_links = [
+                "palm",
+                "index1x", "index2", "index3",
+                "middle1x", "middle2", "middle3",
+                "ring1x", "ring2", "ring3",
+                "pinky1x", "pinky2", "pinky3",
+                "thumb1z", "thumb2", "thumb3",
+            ]
         self.hand_contact_links = set(hand_contact_links)
 
         try:
@@ -182,10 +203,6 @@ class FastContactCalculator:
     ):
         """
         将 MANO 手碰撞点云变换到世界坐标系。
-
-        Returns:
-            merged_hand_points: (B, N, 3)
-            link_slices: List[(link_name, start, end)]
         """
         if len(self.hand_link_pcs) == 0:
             raise RuntimeError("No hand surface point clouds loaded.")
@@ -239,10 +256,6 @@ class FastContactCalculator:
     ):
         """
         Compute MANO joint/link reference positions in world coordinates.
-
-        Returns:
-            hand_joints_world: (B, J, 3)
-            joint_names: List[str]
         """
         if joint_names is None:
             joint_names = list(self.finger_joints)
@@ -277,10 +290,6 @@ class FastContactCalculator:
     ):
         """
         Compute object collision surface points in world coordinates.
-
-        Returns:
-            merged_obj_points: (B, N, 3)
-            link_slices: List[(link_name, start, end)]
         """
         obj_dict = {name: obj_qpos[:, i] for i, name in enumerate(self.obj_joint_names)}
         obj_ret = self.obj_chain.forward_kinematics(obj_dict)
@@ -319,7 +328,7 @@ class FastContactCalculator:
     def compute_batch_contact(self, hand_root_pos, hand_root_rot, hand_qpos, 
                                     obj_root_pos, obj_root_rot, obj_qpos, thresh=0.015):
         """
-        批量计算手与物体的接触标签 (所有输入均为 Tensor，支持 batch_size = B)
+        批量计算手与物体的接触标签
         """
         B = hand_qpos.shape[0]
 
@@ -347,17 +356,11 @@ class FastContactCalculator:
         thresh=0.015,
     ):
         """
-        计算“手部表面点(近似顶点) -> 物体表面点”的距离接触。
-
-        Returns:
-            contact_mask: (B, N_hand_points) bool
-            min_dists: (B, N_hand_points) float
-            link_contact_counts: Dict[str, Tensor(B,)] 每个手部 link 的接触点个数
+        计算"手部表面点(近似顶点) -> 物体表面点"的距离接触。
         """
         B = hand_qpos.shape[0]
 
         if len(self.hand_link_pcs) == 0:
-            # 兜底：没有手部 mesh 点云时退回到关节点接触（维度不同，但至少不中断流程）
             contact_labels, min_dists = self.compute_batch_contact(
                 hand_root_pos, hand_root_rot, hand_qpos, obj_root_pos, obj_root_rot, obj_qpos, thresh=thresh
             )
@@ -401,14 +404,10 @@ class FastContactCalculator:
         obj_root_rot,
         obj_qpos,
         obj_link_filter=None,
+        max_penetration_depth=0.06,  # <--- 💡 修改点：放宽到了 0.06 (6cm)，绝不让 Agent 物理上突破免罚区
     ):
         """
-        计算 query_points 到物体表面的“近似 signed distance”（B, N）。
-
-        说明：
-        - 这里用最近邻点的法向来估计符号（dot((q - p*), n*) 的符号）
-        - 距离的绝对值仍然使用最近邻欧氏距离 (min_dists)
-        - 若 mesh 法向不一致/非闭合，符号可能不稳定（但足够用于“轻量 repulsion/attraction”）
+        Approximate signed distance from query_points to object surface (B, N).
         """
         if query_points_world.dim() != 3 or query_points_world.shape[-1] != 3:
             raise ValueError(f"query_points_world must be (B, N, 3), got {tuple(query_points_world.shape)}")
@@ -460,6 +459,11 @@ class FastContactCalculator:
 
         dot = torch.sum((query_points_world - closest_points) * closest_normals, dim=-1)
         sign = torch.where(dot >= 0.0, torch.ones_like(dot), -torch.ones_like(dot))
+
+        # 安全阀: 无符号距离 > max_penetration_depth 的点不可能真的在物体内部
+        clearly_outside = min_dists > float(max_penetration_depth)
+        sign = torch.where(clearly_outside, torch.ones_like(sign), sign)
+
         signed_dists = sign * min_dists
 
         return signed_dists, min_dists, min_idx
@@ -474,18 +478,7 @@ class FastContactCalculator:
         eps=1e-6,
     ):
         """
-        你提的 contact loss 形式：
-            L = λ_R * L_R + (1 - λ_R) * L_A
-
-        - L_R (repulsion): 惩罚穿插/进入物体内部（signed_dist < 0）
-        - L_A (attraction): 惩罚“已经靠近但还没接触”的点（0 < signed_dist < near_thresh）
-        - 当动作标签显示“不交互”时，λ_R = 1 （只保留排斥项）
-
-        Args:
-            signed_dists: (B, N) signed distance（负数表示沿法向估计的“进入”）
-            interact_mask: (B,) bool/float；1 表示应发生交互/接触；0 表示不交互
-            lambda_r_interact: 交互帧里 repulsion 的权重 (0~1)
-            near_thresh: attraction 的生效范围（只拉近“已经靠近”的点）
+        contact loss 形式： L = λ_R * L_R + (1 - λ_R) * L_A
         """
         if signed_dists.dim() != 2:
             raise ValueError(f"signed_dists must be (B, N), got {tuple(signed_dists.shape)}")
@@ -502,11 +495,8 @@ class FastContactCalculator:
         lambda_r_interact_t = torch.tensor(float(lambda_r_interact), device=device, dtype=dtype)
         lambda_r = torch.where(interact_mask > 0.5, lambda_r_interact_t, torch.ones_like(interact_mask))
 
-        # Repulsion: only penalize the negative part (inside)
         L_R = torch.mean(torch.relu(-signed_dists) ** 2, dim=1)  # (B,)
 
-        # Attraction: only for near-but-not-contact (outside but close)
-        # 你提到的“靠近但没接触”，这里用 [contact_thresh, near_thresh] 来定义。
         near_mask = (signed_dists > float(contact_thresh)) & (signed_dists < float(near_thresh))
         near_count = near_mask.to(dtype=dtype).sum(dim=1)  # (B,)
         L_A_sum = torch.sum((near_mask.to(dtype=dtype) * signed_dists) ** 2, dim=1)
@@ -530,13 +520,6 @@ class FastContactCalculator:
         hand_link_filter=None,
         obj_link_filter=None,
     ):
-        """
-        端到端计算你定义的 contact loss：
-            L = λ_R L_R + (1-λ_R) L_A
-
-        - query points：MANO 碰撞表面点云（可用 hand_link_filter 选子集）
-        - object surface：URDF collision mesh 表面点云（可用 obj_link_filter 选子集）
-        """
         hand_pts, _ = self._compute_hand_surface_points_world(
             hand_root_pos, hand_root_rot, hand_qpos, link_filter=hand_link_filter
         )

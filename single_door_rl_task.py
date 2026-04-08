@@ -19,7 +19,14 @@ PHASE_TO_ID = {
     "success": 4,
 }
 
-CONTACT_LINK_ORDER = ["thumb3", "index3", "middle3", "ring3", "pinky3", "palm"]
+CONTACT_LINK_ORDER = [
+    "thumb3", "thumb2", "thumb1z",
+    "index3", "index2", "index1x",
+    "middle3", "middle2", "middle1x",
+    "ring3", "ring2", "ring1x",
+    "pinky3", "pinky2", "pinky1x",
+    "palm",
+]
 
 
 def _normalize(vec: Sequence[float], fallback: Optional[Sequence[float]] = None) -> np.ndarray:
@@ -72,21 +79,11 @@ def prepare_handle_passthrough_urdf(
     src_urdf: str = "mobility_annotation_gapartnet.urdf",
     dst_urdf: str = "mobility_annotation_gapartnet_passthrough.urdf",
 ) -> str:
-    """Strip collision elements from handle links so MANO fingers can pass through.
-
-    Reads ``link_annotation_gapartnet.json`` to identify which links are handles,
-    then writes a modified copy of the URDF with those links' ``<collision>``
-    elements removed.  Visual geometry is kept so the handle remains visible.
-
-    Returns the absolute path of the generated URDF.  If the output already
-    exists and is newer than both the source URDF and the annotation file,
-    it is returned as-is (no rewrite).
-    """
+    """Strip collision elements from handle links so MANO fingers can pass through."""
     urdf_path = os.path.join(asset_dir, src_urdf)
     anno_path = os.path.join(asset_dir, "link_annotation_gapartnet.json")
     dst_path = os.path.join(asset_dir, dst_urdf)
 
-    # Skip regeneration when output is up-to-date.
     if os.path.exists(dst_path):
         dst_mtime = os.path.getmtime(dst_path)
         if (
@@ -125,7 +122,6 @@ def prepare_handle_passthrough_urdf(
             f"from handle links {handle_link_names} → {dst_path}"
         )
     else:
-        # No handle collision to strip — just copy the original.
         import shutil
         shutil.copy2(urdf_path, dst_path)
         print(f"[handle-passthrough] No handle collisions found; copied URDF → {dst_path}")
@@ -268,7 +264,6 @@ def _find_handle_for_door(
 
 
 def _read_joints_from_urdf(urdf_path: str) -> Dict[str, Dict[str, Any]]:
-    """Read the full kinematic chain from URDF (mirrors the official GAPartNet read_joints_from_urdf_file)."""
     tree = ET.parse(urdf_path)
     root = tree.getroot()
     joint_dict: Dict[str, Dict[str, Any]] = {}
@@ -308,7 +303,6 @@ def _read_joints_from_urdf(urdf_path: str) -> Dict[str, Dict[str, Any]]:
 
 
 def _walk_ancestors(link_name: str, joints_dict: Dict[str, Dict[str, Any]]) -> List[str]:
-    """Return list of ancestor link names from link_name up to the root."""
     child_to_joint: Dict[str, str] = {}
     for jname, jinfo in joints_dict.items():
         child_to_joint[jinfo["child"]] = jname
@@ -322,7 +316,6 @@ def _walk_ancestors(link_name: str, joints_dict: Dict[str, Dict[str, Any]]) -> L
 
 
 def _axangle_to_matrix(axis: np.ndarray, angle: float) -> np.ndarray:
-    """Axis-angle to 3x3 rotation matrix (Rodrigues). Pure numpy, no scipy."""
     ax = np.asarray(axis, dtype=np.float64).ravel()
     norm = float(np.linalg.norm(ax))
     if norm < 1e-12:
@@ -346,16 +339,10 @@ def _transform_bbox_through_chain(
     joint_qpos: Optional[Dict[str, float]] = None,
     base_link_name: str = "base",
 ) -> np.ndarray:
-    """Transform a bbox from link-local space to world space via forward kinematics.
-
-    Mirrors the official GAPartNet ``query_part_pose_from_joint_qpos`` but uses
-    pure numpy instead of SAPIEN so we can run inside Isaac Gym.
-    """
     child_to_joint: Dict[str, str] = {}
     for jname, jinfo in joints_dict.items():
         child_to_joint[jinfo["child"]] = jname
 
-    # Build chain from link up to (but not including) the base joint
     chain: List[str] = []
     cur = link_name
     while cur in child_to_joint:
@@ -363,8 +350,6 @@ def _transform_bbox_through_chain(
         chain.append(jname)
         cur = joints_dict[jname]["parent"]
 
-    # Compute cumulative transforms for each joint origin+axis in world frame
-    # Walk the chain root→leaf, accumulating the FK transform
     chain_reversed = list(reversed(chain))
     cum_pos = np.zeros(3, dtype=np.float64)
     cum_rot = np.eye(3, dtype=np.float64)
@@ -383,7 +368,6 @@ def _transform_bbox_through_chain(
             world_axis = np.array([0.0, 0.0, 1.0])
         joint_world[jname] = (cum_pos.copy(), world_axis.copy())
 
-    # Apply joint transformations to bbox (walk from root to leaf, like the official algo)
     pts = np.asarray(bbox, dtype=np.float64).reshape(-1, 3).copy()
     if joint_qpos is None:
         joint_qpos = {}
@@ -408,12 +392,6 @@ def _find_handle_for_door_chain(
     handle_annos: List[Tuple[int, int, Dict[str, Any]]],
     urdf_path: str,
 ) -> Optional[Tuple[int, int, Dict[str, Any]]]:
-    """Fallback: walk the full kinematic chain to match handles to doors.
-
-    Uses the official GAPartNet approach — a handle belongs to a door if the
-    door link appears anywhere in the handle's ancestor chain (not just as a
-    direct parent).
-    """
     joints_dict = _read_joints_from_urdf(urdf_path)
     chain_matches: List[Tuple[int, int, Dict[str, Any]]] = []
     for handle_gapart_idx, handle_full_idx, handle_anno in handle_annos:
@@ -433,14 +411,7 @@ def _find_any_handle_by_proximity(
     door_link_name: str,
     urdf_path: str,
 ) -> Optional[Tuple[int, int, Dict[str, Any]]]:
-    """Last-resort fallback: find the nearest handle annotation by bbox proximity to the door.
-
-    Uses GAPartNet's TARGET_GAPARTS categories to identify valid handles.
-    """
     HANDLE_CATEGORIES = {"line_fixed_handle", "round_fixed_handle", "hinge_knob", "revolute_handle", "hinge_handle"}
-    joints_dict = _read_joints_from_urdf(urdf_path)
-
-    # Get the door bbox center as reference
     door_center = None
     for anno in annos:
         if anno.get("link_name") == door_link_name and anno.get("bbox"):
@@ -480,7 +451,6 @@ def _match_handle_to_door(
     urdf_path: str,
     door_joint_name: Optional[str],
 ) -> Tuple[Optional[Tuple[int, int, Dict[str, Any]]], str]:
-    """Associate a handle with a door using progressively weaker GAPartNet-style heuristics."""
     match = _find_handle_for_door(door_link_name, handle_annos, parent_map, urdf_path, door_joint_name)
     if match is not None:
         return match, "direct_parent_or_joint"
@@ -610,6 +580,7 @@ class SingleDoorRuntimeState:
     non_interact_min_dist: float
     non_interact_signed_min_dist: float
     non_interact_penetration_depth: float
+    door_plane_violation: float
     handle_attraction_score: float
     non_interact_repulsion_penalty: float
     handle_contact_ratio: float
@@ -875,22 +846,33 @@ def select_single_door_task(asset_dir: str, door_index: int = 0, preferred_door_
     return candidates[selected_index]
 
 
+def _finger_wrap_score(link_counts: Dict[str, int], finger: str, target_points: int) -> float:
+    """Score a single finger across all 3 phalanges (distal/mid/proximal).
+    More phalanges in contact = higher score (rewards wrapping)."""
+    prox_name = finger + ("1z" if finger == "thumb" else "1x")
+    tip = _clip_unit(link_counts.get(finger + "3", 0) / float(target_points))
+    mid = _clip_unit(link_counts.get(finger + "2", 0) / float(target_points))
+    prox = _clip_unit(link_counts.get(prox_name, 0) / float(target_points))
+    # Tip contact is baseline; mid/prox phalanges are the wrapping bonus
+    return float(0.40 * tip + 0.35 * mid + 0.25 * prox)
+
+
 def compute_contact_score(link_counts: Dict[str, int], target_points: int = 6) -> float:
-    thumb = _clip_unit(link_counts.get("thumb3", 0) / float(target_points))
-    index = _clip_unit(link_counts.get("index3", 0) / float(target_points))
-    middle = _clip_unit(link_counts.get("middle3", 0) / float(target_points))
-    ring = _clip_unit(link_counts.get("ring3", 0) / float(target_points))
-    pinky = _clip_unit(link_counts.get("pinky3", 0) / float(target_points))
+    thumb = _finger_wrap_score(link_counts, "thumb", target_points)
+    index = _finger_wrap_score(link_counts, "index", target_points)
+    middle = _finger_wrap_score(link_counts, "middle", target_points)
+    ring = _finger_wrap_score(link_counts, "ring", target_points)
+    pinky = _finger_wrap_score(link_counts, "pinky", target_points)
     palm = _clip_unit(link_counts.get("palm", 0) / float(2 * target_points))
-    return float(0.30 * thumb + 0.22 * index + 0.18 * middle + 0.10 * ring + 0.05 * pinky + 0.15 * palm)
+    return float(0.22 * thumb + 0.20 * index + 0.18 * middle + 0.10 * ring + 0.05 * pinky + 0.25 * palm)
 
 
 def compute_opposition_score(link_counts: Dict[str, int], target_points: int = 6) -> float:
-    thumb = _clip_unit(link_counts.get("thumb3", 0) / float(target_points))
+    thumb = _finger_wrap_score(link_counts, "thumb", target_points)
     four_fingers = max(
-        _clip_unit(link_counts.get("index3", 0) / float(target_points)),
-        _clip_unit(link_counts.get("middle3", 0) / float(target_points)),
-        _clip_unit(link_counts.get("ring3", 0) / float(target_points)),
+        _finger_wrap_score(link_counts, "index", target_points),
+        _finger_wrap_score(link_counts, "middle", target_points),
+        _finger_wrap_score(link_counts, "ring", target_points),
     )
     return float(min(thumb, four_fingers))
 
@@ -901,19 +883,21 @@ def compute_force_closure_score(
     handle_out_alignment: float = 1.0,
     tangent_alignment: float = 1.0,
 ) -> float:
-    thumb = _clip_unit(link_counts.get("thumb3", 0) / float(target_points))
-    index = _clip_unit(link_counts.get("index3", 0) / float(target_points))
-    middle = _clip_unit(link_counts.get("middle3", 0) / float(target_points))
-    ring = _clip_unit(link_counts.get("ring3", 0) / float(target_points))
-    pinky = _clip_unit(link_counts.get("pinky3", 0) / float(target_points))
+    thumb = _finger_wrap_score(link_counts, "thumb", target_points)
+    index = _finger_wrap_score(link_counts, "index", target_points)
+    middle = _finger_wrap_score(link_counts, "middle", target_points)
+    ring = _finger_wrap_score(link_counts, "ring", target_points)
+    pinky = _finger_wrap_score(link_counts, "pinky", target_points)
+    palm = _clip_unit(link_counts.get("palm", 0) / float(2 * target_points))
     finger_wall = max(index, middle, ring)
     finger_support = _clip_unit((index + middle + ring + pinky) / 2.5)
     closure_contact = min(thumb, finger_wall)
-    # Breadth bonus: reward having multiple fingers engaged rather than just one strong contact
     engaged_fingers = sum(1.0 for f in [index, middle, ring, pinky] if f > 0.15)
     breadth_bonus = _clip_unit(engaged_fingers / 3.0)
     alignment_term = _clip_unit(0.65 * handle_out_alignment + 0.35 * tangent_alignment)
-    return float(closure_contact * (0.45 + 0.35 * finger_support + 0.20 * breadth_bonus) * alignment_term)
+    # Palm wrapping boosts force closure
+    wrap_bonus = _clip_unit(0.7 + 0.3 * palm)
+    return float(closure_contact * (0.45 + 0.35 * finger_support + 0.20 * breadth_bonus) * alignment_term * wrap_bonus)
 
 
 def compute_sdf_contact_score(min_dist: float, target_margin: float = 0.002, far_margin: float = 0.015) -> float:
@@ -929,20 +913,17 @@ def compute_sdf_contact_score(min_dist: float, target_margin: float = 0.002, far
 
 
 def compute_envelopment_score(link_counts: Dict[str, int], target_points: int = 6) -> float:
-    """Reward full hand envelopment: bonus when all five fingers + palm wrap around the handle."""
-    thumb = _clip_unit(link_counts.get("thumb3", 0) / float(target_points))
-    index = _clip_unit(link_counts.get("index3", 0) / float(target_points))
-    middle = _clip_unit(link_counts.get("middle3", 0) / float(target_points))
-    ring = _clip_unit(link_counts.get("ring3", 0) / float(target_points))
-    pinky = _clip_unit(link_counts.get("pinky3", 0) / float(target_points))
-    # Geometric mean rewards having all fingers in contact rather than
-    # a few fingers with many points.  A single missing finger zeroes
-    # out the score, strongly encouraging full wrap-around.
-    contacts = [thumb, index, middle, ring, pinky]
-    min_contact = min(contacts)
-    mean_contact = float(np.mean(contacts))
-    # Blend: mostly driven by the weakest link (min) with a mean bonus
-    return float(0.7 * min_contact + 0.3 * mean_contact)
+    thumb = _finger_wrap_score(link_counts, "thumb", target_points)
+    index = _finger_wrap_score(link_counts, "index", target_points)
+    middle = _finger_wrap_score(link_counts, "middle", target_points)
+    ring = _finger_wrap_score(link_counts, "ring", target_points)
+    pinky = _finger_wrap_score(link_counts, "pinky", target_points)
+    palm = _clip_unit(link_counts.get("palm", 0) / float(2 * target_points))
+    finger_scores = [thumb, index, middle, ring, pinky]
+    min_contact = min(finger_scores)
+    mean_contact = float(np.mean(finger_scores))
+    # Palm contact is essential for power grasp
+    return float(0.50 * min_contact + 0.25 * mean_contact + 0.25 * palm)
 
 
 def compute_outside_grasp_score(
@@ -951,35 +932,69 @@ def compute_outside_grasp_score(
     palm_contact_cap: float = 0.25,
     target_points: int = 6,
 ) -> float:
-    thumb = _clip_unit(link_counts.get("thumb3", 0) / float(target_points))
-    index = _clip_unit(link_counts.get("index3", 0) / float(target_points))
-    middle = _clip_unit(link_counts.get("middle3", 0) / float(target_points))
+    thumb = _finger_wrap_score(link_counts, "thumb", target_points)
+    index = _finger_wrap_score(link_counts, "index", target_points)
+    middle = _finger_wrap_score(link_counts, "middle", target_points)
     palm = _clip_unit(link_counts.get("palm", 0) / float(2 * target_points))
     finger_wall = _clip_unit(0.5 * (index + middle))
-    palm_suppression = _clip_unit(1.0 - palm / max(palm_contact_cap, 1e-6))
-    return float(min(thumb, finger_wall) * (0.5 + 0.5 * force_closure_reward) * palm_suppression)
+    # Palm contact is now rewarded (power grasp bonus) instead of suppressed
+    palm_bonus = _clip_unit(0.7 + 0.3 * palm)
+    return float(min(thumb, finger_wall) * (0.5 + 0.5 * force_closure_reward) * palm_bonus)
 
 
 def build_contact_feature_vector(link_counts: Dict[str, int], target_points: int = 6) -> np.ndarray:
     feats = []
     for link_name in CONTACT_LINK_ORDER:
-        denom = float(2 * target_points) if link_name == "palm" else float(target_points)
+        if link_name == "palm":
+            denom = float(2 * target_points)
+        else:
+            denom = float(target_points)
         feats.append(_clip_unit(link_counts.get(link_name, 0) / max(denom, 1.0)))
     return np.asarray(feats, dtype=np.float32)
 
 
 def get_phase_contact_target(phase_name: str) -> np.ndarray:
+    n = len(CONTACT_LINK_ORDER)  # 16
     if phase_name == "approach":
-        return np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        return np.zeros(n, dtype=np.float32)
     if phase_name == "touch":
-        return np.asarray([0.35, 0.25, 0.20, 0.10, 0.05, 0.05], dtype=np.float32)
+        # thumb3/2/1z, index3/2/1x, middle3/2/1x, ring3/2/1x, pinky3/2/1x, palm
+        return np.asarray([
+            0.35, 0.15, 0.05,  # thumb
+            0.25, 0.10, 0.05,  # index
+            0.20, 0.10, 0.05,  # middle
+            0.10, 0.05, 0.0,   # ring
+            0.05, 0.0,  0.0,   # pinky
+            0.15,               # palm
+        ], dtype=np.float32)
     if phase_name == "grasp":
-        return np.asarray([1.0, 0.95, 0.90, 0.75, 0.55, 0.05], dtype=np.float32)
+        return np.asarray([
+            1.0,  0.80, 0.50,  # thumb
+            0.95, 0.80, 0.50,  # index
+            0.90, 0.75, 0.45,  # middle
+            0.75, 0.55, 0.30,  # ring
+            0.55, 0.35, 0.15,  # pinky
+            0.60,               # palm
+        ], dtype=np.float32)
     if phase_name == "actuate":
-        return np.asarray([1.0, 0.95, 0.90, 0.80, 0.60, 0.05], dtype=np.float32)
+        return np.asarray([
+            1.0,  0.85, 0.55,  # thumb
+            0.95, 0.85, 0.55,  # index
+            0.90, 0.80, 0.50,  # middle
+            0.80, 0.60, 0.35,  # ring
+            0.60, 0.40, 0.20,  # pinky
+            0.65,               # palm
+        ], dtype=np.float32)
     if phase_name == "success":
-        return np.asarray([0.85, 0.80, 0.75, 0.70, 0.50, 0.05], dtype=np.float32)
-    return np.zeros(6, dtype=np.float32)
+        return np.asarray([
+            0.85, 0.70, 0.45,  # thumb
+            0.80, 0.65, 0.40,  # index
+            0.75, 0.60, 0.35,  # middle
+            0.70, 0.50, 0.25,  # ring
+            0.50, 0.30, 0.10,  # pinky
+            0.55,               # palm
+        ], dtype=np.float32)
+    return np.zeros(n, dtype=np.float32)
 
 
 def infer_single_door_phase(
@@ -1138,6 +1153,12 @@ def extract_single_door_runtime_state(
         handle_margin=part_handle_margin,
         non_interact_margin=part_non_interact_margin,
     )
+    
+    # 计算当前手掌有没有穿过门板的数学平面
+    plane_normal = world_geom["handle_out_world"]
+    plane_point = world_geom["handle_front_center_world"] - 0.005 * plane_normal
+    signed_plane_dist = float(np.dot(hand_pos - plane_point, plane_normal))
+    door_plane_violation = float(max(0.0, -signed_plane_dist))
 
     return SingleDoorRuntimeState(
         hand_pos=hand_pos,
@@ -1160,6 +1181,7 @@ def extract_single_door_runtime_state(
         non_interact_min_dist=float(part_metrics["non_interact_min_dist"]),
         non_interact_signed_min_dist=float(part_metrics["non_interact_signed_min_dist"]),
         non_interact_penetration_depth=float(part_metrics["non_interact_penetration_depth"]),
+        door_plane_violation=door_plane_violation,
         handle_attraction_score=float(part_metrics["handle_attraction_score"]),
         non_interact_repulsion_penalty=float(part_metrics["non_interact_repulsion_penalty"]),
         handle_contact_ratio=float(part_metrics["handle_contact_ratio"]),
@@ -1195,20 +1217,19 @@ def build_single_door_observation(state: SingleDoorRuntimeState, prev_action: Op
     ang_vel_rel = handle_frame.T @ state.hand_ang_vel
     hinge_rel = handle_frame.T @ (state.hinge_origin_world - state.handle_front_center_world)
 
-    contact_feats = np.array(
-        [
-            _clip_unit(state.surface_contact_link_counts.get("thumb3", 0) / float(contact_target_points)),
-            _clip_unit(state.surface_contact_link_counts.get("index3", 0) / float(contact_target_points)),
-            _clip_unit(state.surface_contact_link_counts.get("middle3", 0) / float(contact_target_points)),
-            _clip_unit(state.surface_contact_link_counts.get("ring3", 0) / float(contact_target_points)),
-            _clip_unit(state.surface_contact_link_counts.get("pinky3", 0) / float(contact_target_points)),
-            _clip_unit(state.surface_contact_link_counts.get("palm", 0) / float(2 * contact_target_points)),
-            compute_contact_score(state.surface_contact_link_counts, target_points=contact_target_points),
-            compute_opposition_score(state.surface_contact_link_counts, target_points=contact_target_points),
-            float(state.surface_contact_stable),
-        ],
-        dtype=np.float32,
-    )
+    # Per-link contact features for all phalanges (power grasp observability)
+    lc = state.surface_contact_link_counts
+    tp = float(contact_target_points)
+    contact_feats_list = []
+    for link_name in CONTACT_LINK_ORDER:
+        denom = float(2 * contact_target_points) if link_name == "palm" else tp
+        contact_feats_list.append(_clip_unit(lc.get(link_name, 0) / max(denom, 1.0)))
+    contact_feats_list.extend([
+        compute_contact_score(lc, target_points=contact_target_points),
+        compute_opposition_score(lc, target_points=contact_target_points),
+        float(state.surface_contact_stable),
+    ])
+    contact_feats = np.asarray(contact_feats_list, dtype=np.float32)
 
     obj_feats = np.array(
         [
@@ -1338,37 +1359,30 @@ def compute_single_door_reward(
         detach_penalty += 0.5
     if state.handle_min_dist > float(cfg.part_handle_margin) and state.non_interact_near_ratio > 0.25:
         detach_penalty += 0.5
-    # --- Penetration penalties (surface_contact_min_dist < 0 means inside object) ---
+
+    # --- Penetration penalties ---
     penetration_depth = float(max(0.0, -state.surface_contact_min_dist))
-    # Mild penalty that ramps linearly with penetration depth (original behaviour,
-    # but now actually fires because min_dist is signed).
+    
+    # Mild penalty
     penetration_penalty = 0.0
     if state.surface_contact_min_dist < -0.001:
         penetration_penalty = float(min(0.05, penetration_depth))
-        # Nullify any progress/tangent reward obtained via cheating through the panel
         if progress_delta > 0.0:
             progress_reward = 0.0
             tangent_reward = 0.0
-    # Heavy flat penalty: a large negative hit whenever any hand point is inside
-    # the door panel.  This teaches the agent that "phasing through" is never
-    # worth the progress it might gain.  The penalty is proportional to depth
-    # but with a steep scale and a guaranteed floor of 1.0 so even a tiny
-    # penetration is strongly punished.
+            
+    # 💡 修改点：放弃完全依赖 SDF，改用纯粹的数学力场平面作为绝对的防御底线
+    plane_violation = float(state.door_plane_violation)
     panel_penetration_penalty = 0.0
-    if penetration_depth > 0.0:
-        panel_penetration_penalty = float(1.0 + cfg.panel_penetration_scale * penetration_depth)
-    # Continuous SDF-based repulsion (softer gradient for the optimiser)
+    if plane_violation > 0.0:
+        # 只要手穿透了把手背后的那个纯数学平面，立刻降维打击，给予巨额惩罚
+        panel_penetration_penalty = float(1.0 + cfg.panel_penetration_scale * plane_violation)
+
+    # SDF 软惩罚保留，但如果 SDF 算了离谱的值，在被 max_penetration_depth 截断后也不会导致惩罚彻底消失
     sdf_penetration_penalty = penetration_depth
-    palm_contact = float(state.surface_contact_link_counts.get("palm", 0))
-    fingertip_contact = float(
-        state.surface_contact_link_counts.get("thumb3", 0)
-        + state.surface_contact_link_counts.get("index3", 0)
-        + state.surface_contact_link_counts.get("middle3", 0)
-    )
+    
+    # Palm penalty removed: power grasp requires palm contact with the handle.
     palm_penalty = 0.0
-    if palm_contact > 0 and state.surface_contact_min_dist < -float(cfg.fingertip_penetration_allowance):
-        palm_ratio = palm_contact / max(1.0, fingertip_contact + palm_contact)
-        palm_penalty = float(min(0.05, palm_ratio * penetration_depth))
 
     action_l2 = 0.0 if action is None else float(np.mean(np.square(np.asarray(action, dtype=np.float32))))
     action_smooth = 0.0
@@ -1396,7 +1410,7 @@ def compute_single_door_reward(
         - cfg.detach_penalty_weight * detach_penalty
         - cfg.penetration_progress_penalty * penetration_penalty
         - cfg.sdf_penetration_weight * sdf_penetration_penalty
-        - cfg.panel_penetration_weight * panel_penetration_penalty
+        - cfg.panel_penetration_weight * panel_penetration_penalty  
         - cfg.palm_penetration_penalty * palm_penalty
         - cfg.part_non_interact_penalty_weight * part_non_interact_penalty
         - (0.0 if outside_grasp_ok else cfg.outside_grasp_penalty * max(0.0, state.progress))
@@ -1427,6 +1441,7 @@ def compute_single_door_reward(
         "non_interact_penetration_depth": float(state.non_interact_penetration_depth),
         "handle_contact_ratio": float(state.handle_contact_ratio),
         "non_interact_near_ratio": float(state.non_interact_near_ratio),
+        "door_plane_violation": float(state.door_plane_violation),
         "pinch": float(pinch_reward),
         "pinch_gate": float(pinch_gate),
         "progress_gate": float(progress_gate),

@@ -73,35 +73,49 @@ MANO_Q_LIMITS = np.asarray(
     dtype=np.float32,
 )
 
+# Power grasp presets: C-shaped hand with high MCP/PIP flexion for full wrap.
+# Joint order per finger: [abduction, MCP_flexion, PIP_flexion, DIP_flexion]
+# Thumb order: [j_thumb1y, j_thumb1z, j_thumb2, j_thumb3]
 PINCH_PRESET_QPOS = np.asarray(
     [
-        0.04, 0.58, 0.92, 0.62,
-        0.02, 0.66, 1.00, 0.68,
-        -0.08, 0.60, 0.84, 0.56,
-        -0.02, 0.64, 0.94, 0.64,
-        1.05, 0.18, 0.58, 0.42,
+        # index:  abd,   MCP,  PIP,  DIP  — deep wrap
+        0.00,  0.95, 1.10, 0.50,
+        # middle
+        0.00,  1.05, 1.20, 0.50,
+        # pinky
+        0.00,  0.90, 1.00, 0.40,
+        # ring
+        0.00,  1.00, 1.10, 0.50,
+        # thumb — opposed, wrapping inward
+        1.30,  0.30, 0.70, 0.40,
     ],
     dtype=np.float32,
 )
 
 PINCH_ACTUATE_QPOS = np.asarray(
     [
-        0.05, 0.62, 1.00, 0.72,
-        0.03, 0.72, 1.08, 0.78,
-        -0.06, 0.64, 0.90, 0.66,
-        -0.01, 0.70, 1.02, 0.74,
-        1.15, 0.22, 0.68, 0.52,
+        0.00,  1.05, 1.20, 0.60,
+        0.00,  1.15, 1.30, 0.60,
+        0.00,  1.00, 1.10, 0.50,
+        0.00,  1.10, 1.20, 0.60,
+        1.40,  0.35, 0.80, 0.50,
     ],
     dtype=np.float32,
 )
 
+# Relaxed C-shape for initial approach — fingers moderately curled, ready to wrap
 PINCH_TOUCH_QPOS = np.asarray(
     [
-        0.02, 0.34, 0.50, 0.24,
-        0.01, 0.38, 0.56, 0.28,
-        -0.04, 0.30, 0.42, 0.20,
-        -0.01, 0.34, 0.50, 0.24,
-        0.80, 0.10, 0.30, 0.18,
+        # index
+        0.00,  0.55, 0.65, 0.30,
+        # middle
+        0.00,  0.60, 0.70, 0.30,
+        # pinky
+        0.00,  0.50, 0.55, 0.20,
+        # ring
+        0.00,  0.55, 0.65, 0.28,
+        # thumb
+        1.00,  0.15, 0.40, 0.20,
     ],
     dtype=np.float32,
 )
@@ -255,7 +269,7 @@ class SingleDoorResidualConfig:
     max_episode_steps: int = 120
     action_repeat: int = 2
     settle_steps: int = 6
-    pregrasp_offset: float = 0.04
+    pregrasp_offset: float = 0.01
     trajectory_steps: int = 100
     max_open_amount: float = 1.2
     pos_action_scale: float = 0.015
@@ -287,7 +301,7 @@ class SingleDoorResidualConfig:
     max_safe_penetration: float = -0.003
     door_plane_buffer: float = 0.003
     palm_safe_buffer: float = 0.005
-    handle_passthrough: bool = True
+    handle_passthrough: bool = False
 
 
 class SingleDoorResidualEnv:
@@ -484,19 +498,21 @@ class SingleDoorResidualEnv:
         }
 
     def _score_pinch_contact(self, link_counts: Dict[str, int], contact_count: int) -> float:
-        thumb = float(link_counts.get("thumb3", 0))
-        fingers = np.asarray(
-            [
-                float(link_counts.get("index3", 0)),
-                float(link_counts.get("middle3", 0)),
-                float(link_counts.get("ring3", 0)),
-                float(link_counts.get("pinky3", 0)),
-            ],
-            dtype=np.float32,
+        palm = float(link_counts.get("palm", 0))
+        index2 = float(link_counts.get("index2", 0))
+        middle2 = float(link_counts.get("middle2", 0))
+        ring2 = float(link_counts.get("ring2", 0))
+        index1x = float(link_counts.get("index1x", 0))
+        middle1x = float(link_counts.get("middle1x", 0))
+        thumb2 = float(link_counts.get("thumb2", 0))
+        # Power grasp: palm and mid-phalanges wrapping the handle are most important
+        return float(
+            0.35 * contact_count
+            + 8.0 * palm
+            + 5.0 * (index2 + middle2)
+            + 3.0 * (ring2 + thumb2)
+            + 2.0 * (index1x + middle1x)
         )
-        strong_fingers = float(np.sum(fingers >= 2.0))
-        finger_balance = float(np.min([thumb, np.max(fingers), np.mean(np.sort(fingers)[-2:])]))
-        return float(0.35 * contact_count + 6.0 * strong_fingers + 4.0 * finger_balance)
 
     def _search_pinch_grasp(
         self,
@@ -548,7 +564,7 @@ class SingleDoorResidualEnv:
                         obj_urdf_path=obj_urdf_path,
                         surface_contact_thresh=0.020,
                         min_contact_points=20,
-                        required_contact_links=["thumb3", "index3", "middle3"],
+                        required_contact_links=["palm", "index2"],
                         min_points_per_link=2,
                         settle_steps=10,
                         max_iters=10,
@@ -709,7 +725,7 @@ class SingleDoorResidualEnv:
                 handle_out=world_geom["handle_out_world"],
                 handle_long=world_geom["handle_long_world"],
             )
-            anchor_qpos = self._clip_hand_qpos(opt_qpos)
+            anchor_qpos = self.closed_qpos.copy()  # Discard pinch opt_qpos; keep power grasp preset
             anchor_pose = np.concatenate([opt_pos, opt_rot], axis=0).astype(np.float32)
         else:
             anchor_qpos = self.closed_qpos.copy()
@@ -776,9 +792,9 @@ class SingleDoorResidualEnv:
                 approach_dir=-world_geom["handle_out_world"],
                 obj_urdf_path=self.task_spec.urdf_path,
                 surface_contact_thresh=0.015,
-                min_contact_points=60,
-                required_contact_links=["index3", "middle3", "ring3", "pinky3", "thumb3"],
-                min_points_per_link=3,
+                min_contact_points=40,
+                required_contact_links=["palm", "index2", "middle2"],
+                min_points_per_link=2,
                 settle_steps=8,
                 max_iters=12,
                 push_step=0.002,

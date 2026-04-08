@@ -65,7 +65,7 @@ class ActorCritic(nn.Module):
         )
         self.actor_mean = nn.Linear(hidden_dim, action_dim)
         self.critic = nn.Linear(hidden_dim, 1)
-        self.contact_head = nn.Linear(hidden_dim, 6)
+        self.contact_head = nn.Linear(hidden_dim, 16)
         self.log_std = nn.Parameter(torch.ones(action_dim) * np.log(action_std_init))
 
     def forward(self, obs: torch.Tensor):
@@ -255,7 +255,7 @@ def main():
             reward_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
             done_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
             value_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
-            contact_vec_target_buf = np.zeros((ppo_cfg.rollout_steps, num_envs, 6), dtype=np.float32)
+            contact_vec_target_buf = np.zeros((ppo_cfg.rollout_steps, num_envs, 16), dtype=np.float32)
             teacher_action_buf = np.zeros((ppo_cfg.rollout_steps, num_envs, action_dim), dtype=np.float32)
             progress_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
             stable_contact_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
@@ -286,7 +286,7 @@ def main():
                 reward_buf[step] = np.atleast_1d(np.asarray(reward, dtype=np.float32))
                 done_buf[step] = np.atleast_1d(np.asarray(done, dtype=np.float32))
                 value_buf[step] = np.atleast_1d(np.asarray(value_tensor.cpu().numpy(), dtype=np.float32))
-                contact_vec_target_buf[step] = np.asarray(info["contact_target"], dtype=np.float32).reshape(num_envs, 6)
+                contact_vec_target_buf[step] = np.asarray(info["contact_target"], dtype=np.float32).reshape(num_envs, 16)
                 teacher_action_buf[step] = np.asarray(teacher_action, dtype=np.float32).reshape(num_envs, action_dim)
                 progress_buf[step] = np.atleast_1d(np.asarray(info["progress"], dtype=np.float32))
                 stable_contact_buf[step] = np.atleast_1d(np.asarray(info["surface_contact_stable"], dtype=np.float32))
@@ -341,7 +341,7 @@ def main():
             flat_logp = logp_buf.reshape(-1)
             flat_adv = advantages.reshape(-1)
             flat_returns = returns.reshape(-1)
-            flat_contact = contact_vec_target_buf.reshape(-1, 6)
+            flat_contact = contact_vec_target_buf.reshape(-1, 16)
             flat_teacher_action = teacher_action_buf.reshape(-1, action_dim)
             flat_values = value_buf.reshape(-1)
 

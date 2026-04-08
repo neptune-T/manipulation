@@ -1717,7 +1717,21 @@ class ObjectGym():
             pos_action[:, : self.mano_num_dofs] = target_qpos_tensor
             self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(pos_action))
 
-            self.run_steps(pre_steps=settle_steps, refresh_obs=True, print_step=False)
+            # Teacher forcing: step one frame at a time and re-anchor
+            # the hand root after each physics step to prevent contact
+            # forces from pushing the hand away during settling.
+            pose_pos_t = torch.tensor(pose[:3], dtype=torch.float32, device=self.device)
+            pose_rot_t = torch.tensor(pose[3:7], dtype=torch.float32, device=self.device)
+            for _settle_i in range(settle_steps):
+                self.run_steps(pre_steps=1, refresh_obs=True, print_step=False)
+                tf_root = self.root_states.clone()
+                for env_i in range(self.num_envs):
+                    mano_idx = self.mano_actor_idxs[env_i]
+                    tf_root[mano_idx, :3] = pose_pos_t
+                    tf_root[mano_idx, 3:7] = pose_rot_t
+                    tf_root[mano_idx, 7:13] = 0.0
+                self._set_mano_root_state_tensor(tf_root)
+                self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(pos_action))
 
             contact_count, link_counts, min_dist = self._compute_surface_contact_summary(
                 hand_pose_6d=pose,
@@ -1827,6 +1841,21 @@ class ObjectGym():
             self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(pos_action))
 
             self.run_steps(pre_steps=1, refresh_obs=True, print_step=False)
+
+            # --- Teacher forcing: re-anchor hand to the intended trajectory ---
+            # After physics resolves contacts, the hand root may have been pushed
+            # away from the target pose. Re-set the root state to prevent drift
+            # accumulation while preserving the force already transmitted to the
+            # object during this step.
+            tf_root = self.root_states.clone()
+            for env_i in range(self.num_envs):
+                mano_idx = self.mano_actor_idxs[env_i]
+                tf_root[mano_idx, :3] = torch.tensor(current_pos, dtype=torch.float32, device=self.device)
+                tf_root[mano_idx, 3:7] = torch.tensor(current_rot, dtype=torch.float32, device=self.device)
+                tf_root[mano_idx, 7:13] = 0.0  # zero residual velocity
+            self._set_mano_root_state_tensor(tf_root)
+            # Re-apply finger targets so PD controller stays locked
+            self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(pos_action))
 
             current_hand_qpos = (
                 self.dof_pos[0, : self.mano_num_dofs, 0].detach().cpu().numpy().tolist()
