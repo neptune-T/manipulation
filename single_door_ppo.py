@@ -41,14 +41,14 @@ class PPOConfig:
     hidden_dim: int = 256
     action_std_init: float = 0.40
     save_every: int = 20
-    bc_coef: float = 0.1
+    bc_coef: float = 2.0
     bc_coef_min: float = 0.01
-    bc_coef_decay: float = 0.90
+    bc_coef_decay: float = 0.98
     contact_aux_coef: float = 0.35
     value_clip: float = 0.2
-    teacher_forcing_coef: float = 0.25
+    teacher_forcing_coef: float = 0.6
     teacher_forcing_min: float = 0.05
-    teacher_forcing_decay: float = 0.90
+    teacher_forcing_decay: float = 0.98
     teacher_forcing_success_threshold: float = 0.80
     teacher_forcing_window: int = 20
     target_kl: float = 0.015
@@ -150,12 +150,12 @@ def main():
     parser.add_argument("--reset-pose-noise", type=float, default=0.002)
     parser.add_argument("--reset-rot-noise", type=float, default=0.02)
     parser.add_argument("--policy-init-std", type=float, default=0.40)
-    parser.add_argument("--bc-coef", type=float, default=0.1)
+    parser.add_argument("--bc-coef", type=float, default=2.0)
     parser.add_argument("--bc-coef-min", type=float, default=0.01)
-    parser.add_argument("--bc-coef-decay", type=float, default=0.90)
-    parser.add_argument("--teacher-forcing-coef", type=float, default=0.25)
+    parser.add_argument("--bc-coef-decay", type=float, default=0.98)
+    parser.add_argument("--teacher-forcing-coef", type=float, default=0.6)
     parser.add_argument("--teacher-forcing-min", type=float, default=0.05)
-    parser.add_argument("--teacher-forcing-decay", type=float, default=0.90)
+    parser.add_argument("--teacher-forcing-decay", type=float, default=0.98)
     parser.add_argument("--teacher-forcing-success-threshold", type=float, default=0.80)
     parser.add_argument("--teacher-forcing-window", type=int, default=20)
     parser.add_argument("--entropy-coef", type=float, default=0.008)
@@ -259,6 +259,9 @@ def main():
             teacher_action_buf = np.zeros((ppo_cfg.rollout_steps, num_envs, action_dim), dtype=np.float32)
             progress_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
             stable_contact_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
+            palm_handle_dist_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
+            palm_bps_contact_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
+            tracking_gate_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
 
             for step in range(ppo_cfg.rollout_steps):
                 global_step += num_envs
@@ -266,7 +269,12 @@ def main():
                 with torch.no_grad():
                     action_tensor, logp_tensor, value_tensor, contact_logit_tensor = model.act(obs_tensor)
                 sampled_action = action_tensor.cpu().numpy().astype(np.float32)
-                teacher_action = env.get_teacher_action(step_index=step)
+                teacher_action = np.asarray(
+                    env.get_teacher_action(step_index=env.step_count),
+                    dtype=np.float32,
+                ).reshape(1, action_dim)
+                if num_envs > 1:
+                    teacher_action = np.repeat(teacher_action, num_envs, axis=0)
                 action = (
                     (1.0 - ppo_cfg.teacher_forcing_coef) * sampled_action
                     + ppo_cfg.teacher_forcing_coef * teacher_action
@@ -287,9 +295,12 @@ def main():
                 done_buf[step] = np.atleast_1d(np.asarray(done, dtype=np.float32))
                 value_buf[step] = np.atleast_1d(np.asarray(value_tensor.cpu().numpy(), dtype=np.float32))
                 contact_vec_target_buf[step] = np.asarray(info["contact_target"], dtype=np.float32).reshape(num_envs, 16)
-                teacher_action_buf[step] = np.asarray(teacher_action, dtype=np.float32).reshape(num_envs, action_dim)
+                teacher_action_buf[step] = teacher_action
                 progress_buf[step] = np.atleast_1d(np.asarray(info["progress"], dtype=np.float32))
                 stable_contact_buf[step] = np.atleast_1d(np.asarray(info["surface_contact_stable"], dtype=np.float32))
+                palm_handle_dist_buf[step] = np.atleast_1d(np.asarray(info["palm_handle_min_dist"], dtype=np.float32))
+                palm_bps_contact_buf[step] = np.atleast_1d(np.asarray(info["palm_bps_contact_ratio"], dtype=np.float32))
+                tracking_gate_buf[step] = np.atleast_1d(np.asarray(info["reward_terms"]["tracking_gate"], dtype=np.float32))
 
                 obs = np.asarray(next_obs, dtype=np.float32)
                 if obs.ndim == 1:
@@ -421,6 +432,9 @@ def main():
             success_rate = float(np.mean([float(item["success"]) for item in recent])) if recent else 0.0
             rollout_contact_rate = float(np.mean(stable_contact_buf))
             rollout_progress = float(np.mean(progress_buf))
+            rollout_palm_handle_dist = float(np.mean(palm_handle_dist_buf))
+            rollout_palm_bps_contact = float(np.mean(palm_bps_contact_buf))
+            rollout_tracking_gate = float(np.mean(tracking_gate_buf))
             tf_recent = history[-int(max(1, ppo_cfg.teacher_forcing_window)) :]
             tf_recent_success = float(np.mean([float(item["success"]) for item in tf_recent])) if tf_recent else 0.0
             if tf_recent and tf_recent_success >= float(ppo_cfg.teacher_forcing_success_threshold):
@@ -448,6 +462,7 @@ def main():
                 f"update={update:04d} avg_return={avg_return:.3f} "
                 f"avg_progress={avg_progress:.4f} success_rate={success_rate:.2f} "
                 f"rollout_contact={rollout_contact_rate:.2f} rollout_prog={rollout_progress:.4f} "
+                f"palm_dist={rollout_palm_handle_dist:.4f} palm_bps={rollout_palm_bps_contact:.2f} track_gate={rollout_tracking_gate:.2f} "
                 f"bc={last_stats.get('bc_loss', 0.0):.4f} contact_aux={last_stats.get('contact_aux_loss', 0.0):.4f} "
                 f"tf={ppo_cfg.teacher_forcing_coef:.2f} bc_coef={ppo_cfg.bc_coef:.3f} tf_recent={tf_recent_success:.2f} "
                 f"phase={env.get_curriculum_phase()}"
@@ -460,6 +475,9 @@ def main():
                     "success_rate": float(success_rate),
                     "rollout_contact_rate": float(rollout_contact_rate),
                     "rollout_progress": float(rollout_progress),
+                    "rollout_palm_handle_dist": float(rollout_palm_handle_dist),
+                    "rollout_palm_bps_contact": float(rollout_palm_bps_contact),
+                    "rollout_tracking_gate": float(rollout_tracking_gate),
                     "bc_coef": float(ppo_cfg.bc_coef),
                     "bc_recent_success": float(tf_recent_success),
                     "teacher_forcing_coef": float(ppo_cfg.teacher_forcing_coef),

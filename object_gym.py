@@ -787,12 +787,18 @@ class ObjectGym():
         if use_handle_passthrough:
             from single_door_rl_task import prepare_handle_passthrough_urdf
             arti_obj_paths = []
+            self.arti_obj_urdf_paths_abs = []
             for gapartnet_id in self.gapartnet_ids:
                 asset_dir_abs = os.path.join(self.asset_root, self.gapartnet_root, gapartnet_id)
                 pt_path = prepare_handle_passthrough_urdf(asset_dir_abs)
                 arti_obj_paths.append(os.path.relpath(pt_path, self.asset_root))
+                self.arti_obj_urdf_paths_abs.append(os.path.abspath(pt_path))
         else:
             arti_obj_paths = [f"{self.gapartnet_root}/{gapartnet_id}/mobility_annotation_gapartnet.urdf" for gapartnet_id in self.gapartnet_ids]
+            self.arti_obj_urdf_paths_abs = [
+                os.path.join(self.asset_root, self.gapartnet_root, str(gapartnet_id), "mobility_annotation_gapartnet.urdf")
+                for gapartnet_id in self.gapartnet_ids
+            ]
 
         arti_obj_asset_options = gymapi.AssetOptions()
         # arti_obj_asset_options.disable_gravity = True     # if not disabled, it will need a very initial large force to open a drawer
@@ -1586,6 +1592,8 @@ class ObjectGym():
     def _get_current_arti_obj_urdf_path(self):
         if not self.cfgs.get("USE_ARTI", False):
             return None
+        if hasattr(self, "arti_obj_urdf_paths_abs") and len(self.arti_obj_urdf_paths_abs) > 0:
+            return self.arti_obj_urdf_paths_abs[0]
         if not hasattr(self, "gapartnet_root") or not hasattr(self, "gapartnet_ids"):
             return None
         if len(self.gapartnet_ids) == 0:

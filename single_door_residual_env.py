@@ -22,8 +22,10 @@ try:
         SingleDoorTaskSpec,
         build_single_door_observation,
         build_contact_feature_vector,
+        compute_bps_features,
         compute_single_door_reward,
         extract_single_door_runtime_state,
+        generate_bps_basis,
         get_phase_contact_target,
         select_articulation_task,
         select_single_door_task,
@@ -39,8 +41,10 @@ except ImportError:
         SingleDoorTaskSpec,
         build_single_door_observation,
         build_contact_feature_vector,
+        compute_bps_features,
         compute_single_door_reward,
         extract_single_door_runtime_state,
+        generate_bps_basis,
         get_phase_contact_target,
         select_articulation_task,
         select_single_door_task,
@@ -302,6 +306,15 @@ class SingleDoorResidualConfig:
     door_plane_buffer: float = 0.003
     palm_safe_buffer: float = 0.005
     handle_passthrough: bool = False
+    fake_force_enabled: bool = False
+    fake_force_contact_threshold: float = 0.4
+    fake_force_palm_threshold: float = 0.25
+    fake_force_mid_contact_threshold: float = 0.35
+    fake_force_coupling_gain: float = 1.0
+    fake_force_max_delta: float = 0.05
+    fake_force_min_pull: float = 5e-4
+    bps_num_points: int = 64
+    bps_radius: float = 0.08
 
 
 class SingleDoorResidualEnv:
@@ -315,6 +328,10 @@ class SingleDoorResidualEnv:
         self.task_spec: SingleDoorTaskSpec = select_articulation_task(self.asset_dir, task_index=selected_task_index)
         self.asset_root, self.arti_obj_root, self.gapart_id = self._resolve_asset_paths(self.asset_dir)
         self.gym, self.cfgs = self._init_gym()
+        self.geometry_obj_urdf_path = self.task_spec.urdf_path
+        self.sim_obj_urdf_path = self.gym._get_current_arti_obj_urdf_path()
+        if self.sim_obj_urdf_path is None:
+            self.sim_obj_urdf_path = self.geometry_obj_urdf_path
         self.reward_config = self.config.reward_config
         self.reward_config.success_progress = float(self.task_spec.success_progress)
         self.obj_scale = float(self.cfgs["asset"]["arti_obj_scale"])
@@ -338,6 +355,10 @@ class SingleDoorResidualEnv:
         self.curriculum_level = 0
         self.curriculum_history = []
         self.grasp_settle_counter = 0
+        self.handle_point_cloud_np: Optional[np.ndarray] = None
+        self.bps_basis_points: Optional[np.ndarray] = None
+        self.bps_palm_target_mask: Optional[np.ndarray] = None
+        self.cached_bps_features: Optional[np.ndarray] = None
         self._prepare_teacher()
 
     def _resolve_asset_paths(self, asset_dir: str) -> Tuple[str, str, str]:
@@ -612,11 +633,65 @@ class SingleDoorResidualEnv:
         return R.from_matrix(rot_mat).inv().as_quat().astype(np.float32)
 
     def _current_world_geom(self) -> Dict[str, np.ndarray]:
+        drive_joint_qpos = 0.0
+        if self.drive_dof_index is not None:
+            drive_joint_qpos = float(self.gym.dof_pos[0, self.gym.mano_num_dofs + self.drive_dof_index, 0].item())
         return self.task_spec.world_geometry(
             obj_world_pos=self.gym.arti_init_obj_pos_list[0],
             obj_world_rot=self.gym.arti_init_obj_rot_list[0],
             obj_scale=self.obj_scale,
+            drive_joint_qpos=drive_joint_qpos,
         )
+
+    def _refine_teacher_world_geom(
+        self,
+        base_world_geom: Dict[str, np.ndarray],
+        handle_point_cloud,
+    ) -> Dict[str, np.ndarray]:
+        refined = {k: np.asarray(v, dtype=np.float32).copy() for k, v in base_world_geom.items()}
+
+        if self.npcs_handle_loc is not None:
+            npcs_center = self.npcs_handle_loc.handle_center.detach().cpu().numpy().astype(np.float32)
+            npcs_long = self.npcs_handle_loc.handle_long_axis.detach().cpu().numpy().astype(np.float32)
+            npcs_out = self.npcs_handle_loc.handle_normal.detach().cpu().numpy().astype(np.float32)
+            if float(np.dot(npcs_long, refined["handle_long_world"])) < 0.0:
+                npcs_long = -npcs_long
+            if float(np.dot(npcs_out, refined["handle_out_world"])) < 0.0:
+                npcs_out = -npcs_out
+            refined["handle_center_world"] = npcs_center
+            refined["handle_out_world"] = _normalize(npcs_out, fallback=refined["handle_out_world"])
+            refined["handle_long_world"] = _normalize(npcs_long, fallback=refined["handle_long_world"])
+
+        if handle_point_cloud is not None:
+            if isinstance(handle_point_cloud, torch.Tensor):
+                handle_pc_world = handle_point_cloud.detach().cpu().numpy().astype(np.float32)
+            else:
+                handle_pc_world = np.asarray(handle_point_cloud, dtype=np.float32)
+            if handle_pc_world.ndim == 3:
+                handle_pc_world = handle_pc_world.reshape(-1, 3)
+            if handle_pc_world.shape[0] > 0:
+                refined["handle_center_world"] = np.mean(handle_pc_world, axis=0).astype(np.float32)
+
+        refined["handle_short_world"] = _normalize(
+            np.cross(-refined["handle_out_world"], refined["handle_long_world"]),
+            fallback=refined["handle_short_world"],
+        )
+        refined["handle_long_world"] = _normalize(
+            np.cross(refined["handle_short_world"], -refined["handle_out_world"]),
+            fallback=refined["handle_long_world"],
+        )
+        handle_depth = float(self.task_spec.handle_extent_local[0]) * float(self.obj_scale)
+        refined["handle_front_center_world"] = (
+            refined["handle_center_world"] + 0.5 * handle_depth * refined["handle_out_world"]
+        ).astype(np.float32)
+        radial = refined["handle_center_world"] - refined["hinge_origin_world"]
+        radial = radial - refined["hinge_axis_world"] * np.dot(radial, refined["hinge_axis_world"])
+        radial = _normalize(radial, fallback=refined["handle_out_world"])
+        refined["open_tangent_world"] = _normalize(
+            self.task_spec.open_sign * np.cross(refined["hinge_axis_world"], radial),
+            fallback=refined["handle_long_world"],
+        )
+        return refined
 
     def get_handle_geometry_diagnostics(self) -> Dict[str, Any]:
         local_extent = np.asarray(self.task_spec.handle_extent_local, dtype=np.float32) * float(self.obj_scale)
@@ -657,23 +732,21 @@ class SingleDoorResidualEnv:
         return float(np.clip(open_amount, -self.config.max_open_amount, self.config.max_open_amount))
 
     def _prepare_teacher(self) -> None:
-        world_geom = self._current_world_geom()
-        init_rotation = self._estimate_initial_rotation(world_geom)
-        pregrasp_position = world_geom["handle_front_center_world"] + self.config.pregrasp_offset * world_geom["handle_out_world"]
-        self.pregrasp_pose = np.concatenate([pregrasp_position, init_rotation], axis=0).astype(np.float32)
+        base_world_geom = self._current_world_geom()
 
         mano_urdf_path = os.path.join(self.repo_root, "urdf", "mano.urdf")
-        obj_urdf_path = self.task_spec.urdf_path
+        geometry_obj_urdf_path = self.geometry_obj_urdf_path
+        sim_obj_urdf_path = self.sim_obj_urdf_path
 
         # --- Collision-mesh handle PC (primary — actual mesh surface) ---
         handle_point_cloud = None
         self.npcs_handle_loc = None
         handle_point_cloud = _build_handle_point_cloud_from_collision_mesh(
             gym=self.gym,
-            obj_urdf_path=obj_urdf_path,
+            obj_urdf_path=geometry_obj_urdf_path,
             link_name=self.task_spec.handle_link_name,
-            handle_center=world_geom["handle_front_center_world"],
-            handle_out=world_geom["handle_out_world"],
+            handle_center=base_world_geom["handle_front_center_world"],
+            handle_out=base_world_geom["handle_out_world"],
             num_points=1500,
             points_per_link=2500,
             backside_margin=None,
@@ -712,8 +785,15 @@ class SingleDoorResidualEnv:
 
         # --- Bbox sampling last resort ---
         if handle_point_cloud is None:
-            handle_point_cloud = self._sample_bbox_handle_pc(world_geom)
+            handle_point_cloud = self._sample_bbox_handle_pc(base_world_geom)
             print(f"[HandlePC] Bbox fallback: {handle_point_cloud.shape[0]} pts")
+
+        world_geom = self._refine_teacher_world_geom(base_world_geom, handle_point_cloud)
+        init_rotation = self._estimate_initial_rotation(world_geom)
+        handle_depth = float(self.task_spec.handle_extent_local[0]) * float(self.obj_scale)
+        pregrasp_offset = max(float(self.config.pregrasp_offset), 0.5 * handle_depth + 0.004)
+        pregrasp_position = world_geom["handle_center_world"] + pregrasp_offset * world_geom["handle_out_world"]
+        self.pregrasp_pose = np.concatenate([pregrasp_position, init_rotation], axis=0).astype(np.float32)
 
         if self.config.use_optimized_grasp:
             opt_pos, opt_rot, opt_qpos = run_optimization(
@@ -738,14 +818,14 @@ class SingleDoorResidualEnv:
                 start_pose=anchor_pose,
                 target_qpos=anchor_qpos,
                 world_geom=world_geom,
-                obj_urdf_path=obj_urdf_path,
+                obj_urdf_path=sim_obj_urdf_path,
             )
         elif self.config.stabilize_grasp:
             anchor_pose, stable, grasp_info = self.gym.stabilize_grasp_by_surface_contact(
                 start_pose_6d=anchor_pose,
                 target_qpos=anchor_qpos,
                 approach_dir=-world_geom["handle_out_world"],
-                obj_urdf_path=obj_urdf_path,
+                obj_urdf_path=sim_obj_urdf_path,
                 surface_contact_thresh=0.015,
                 min_contact_points=60,
                 required_contact_links=["index3", "middle3", "ring3", "pinky3", "thumb3"],
@@ -776,6 +856,40 @@ class SingleDoorResidualEnv:
             "demo_traj_len": int(len(self.demo_traj)),
         }
 
+        # --- BPS computation: cache handle PC in handle-local frame + basis ---
+        # Convert handle_point_cloud (world frame, possibly torch) to numpy
+        if isinstance(handle_point_cloud, torch.Tensor):
+            handle_pc_world = handle_point_cloud.detach().cpu().numpy().astype(np.float32)
+        else:
+            handle_pc_world = np.asarray(handle_point_cloud, dtype=np.float32)
+        if handle_pc_world.ndim == 3:
+            handle_pc_world = handle_pc_world.reshape(-1, 3)
+        # Transform to handle-local frame (centered at handle_front_center, axes = handle frame)
+        handle_frame_mat = np.stack(
+            [world_geom["handle_long_world"], world_geom["handle_short_world"], -world_geom["handle_out_world"]],
+            axis=1,
+        )  # (3, 3) columns are axes
+        handle_center = world_geom["handle_front_center_world"]
+        handle_pc_local = (handle_pc_world - handle_center) @ handle_frame_mat  # (N, 3) in local
+        self.handle_point_cloud_np = handle_pc_local
+
+        # Generate and cache BPS basis points (fixed across episodes)
+        self.bps_basis_points = generate_bps_basis(
+            num_points=self.config.bps_num_points,
+            radius=self.config.bps_radius,
+        )
+        self.bps_palm_target_mask = (self.bps_basis_points[:, 2] <= 0.0)
+        if not np.any(self.bps_palm_target_mask):
+            self.bps_palm_target_mask = np.ones((self.bps_basis_points.shape[0],), dtype=np.bool_)
+
+        # Precompute BPS (handle is static relative to object root at init)
+        self.cached_bps_features = compute_bps_features(
+            basis_points_local=self.bps_basis_points,
+            handle_pc_local=self.handle_point_cloud_np,
+        )
+        print(f"[BPS] Computed {self.cached_bps_features.shape[0]} BPS features, "
+              f"handle PC {self.handle_point_cloud_np.shape[0]} pts")
+
     def _stabilize_reset_grasp(self, hand_pose: np.ndarray, hand_qpos: np.ndarray) -> Tuple[np.ndarray, bool, Dict[str, Any]]:
         world_geom = self._current_world_geom()
         if self.config.pinch_search_enabled:
@@ -783,14 +897,14 @@ class SingleDoorResidualEnv:
                 start_pose=hand_pose,
                 target_qpos=hand_qpos,
                 world_geom=world_geom,
-                obj_urdf_path=self.task_spec.urdf_path,
+                obj_urdf_path=self.sim_obj_urdf_path,
             )
         else:
             stabilized_pose, stable, grasp_info = self.gym.stabilize_grasp_by_surface_contact(
                 start_pose_6d=hand_pose,
                 target_qpos=hand_qpos,
                 approach_dir=-world_geom["handle_out_world"],
-                obj_urdf_path=self.task_spec.urdf_path,
+                obj_urdf_path=self.sim_obj_urdf_path,
                 surface_contact_thresh=0.015,
                 min_contact_points=40,
                 required_contact_links=["palm", "index2", "middle2"],
@@ -1012,6 +1126,27 @@ class SingleDoorResidualEnv:
             "teacher_pull_hint": bool(teacher_phase == "grasp"),
         }
 
+    def get_teacher_root_pos(self, step_index: Optional[int] = None) -> np.ndarray:
+        """Return teacher trajectory wrist position for the given step."""
+        if step_index is None:
+            step_index = self.step_count
+        pose, _ = self.get_demo_base(step_index=step_index)
+        return pose[:3].astype(np.float32)
+
+    def get_teacher_root_rot(self, step_index: Optional[int] = None) -> np.ndarray:
+        """Return teacher trajectory wrist quaternion for the given step."""
+        if step_index is None:
+            step_index = self.step_count
+        pose, _ = self.get_demo_base(step_index=step_index)
+        return pose[3:7].astype(np.float32)
+
+    def get_teacher_qpos(self, step_index: Optional[int] = None) -> np.ndarray:
+        """Return teacher target finger qpos for the given step."""
+        if step_index is None:
+            step_index = self.step_count
+        _, qpos = self.get_demo_base(step_index=step_index)
+        return qpos.astype(np.float32)
+
     def _apply_pose_action(self, base_pose: Sequence[float], action: Sequence[float]) -> np.ndarray:
         base_pose_arr = np.asarray(base_pose, dtype=np.float32).reshape(7)
         action_arr = np.asarray(action, dtype=np.float32).reshape(6)
@@ -1056,8 +1191,104 @@ class SingleDoorResidualEnv:
     def _door_plane_violation(self, runtime_state) -> float:
         plane_normal = runtime_state.handle_out_world
         plane_point = runtime_state.handle_front_center_world - float(self.config.palm_safe_buffer) * plane_normal
-        signed_dist = float(np.dot(runtime_state.hand_pos - plane_point, plane_normal))
+        signed_dist = float(np.dot(runtime_state.palm_center_world - plane_point, plane_normal))
         return float(max(0.0, -signed_dist))
+
+    def _extract_runtime_state(self):
+        return extract_single_door_runtime_state(
+            self.gym,
+            self.task_spec,
+            env_i=0,
+            surface_contact_thresh=0.015,
+            min_contact_points=self.config.min_contact_points,
+            contact_target_points=self.config.contact_target_points,
+            handle_bps_features=self.cached_bps_features,
+            bps_basis_points=self.bps_basis_points,
+            bps_target_mask=self.bps_palm_target_mask,
+            contact_obj_urdf_path=self.sim_obj_urdf_path,
+        )
+
+    def _power_grasp_established(self, runtime_state) -> bool:
+        link_counts = runtime_state.surface_contact_link_counts
+        palm_ratio = float(link_counts.get("palm", 0)) / max(1.0, 2.0 * float(self.config.contact_target_points))
+        mid_links = (
+            float(link_counts.get("thumb2", 0))
+            + float(link_counts.get("index2", 0))
+            + float(link_counts.get("middle2", 0))
+            + float(link_counts.get("ring2", 0))
+            + float(link_counts.get("pinky2", 0))
+        )
+        mid_ratio = mid_links / max(1.0, 5.0 * float(self.config.contact_target_points))
+        return bool(
+            runtime_state.surface_contact_stable
+            or runtime_state.handle_contact_ratio >= float(self.config.fake_force_contact_threshold)
+            or (
+                runtime_state.palm_handle_min_dist <= 0.020
+                and runtime_state.palm_bps_contact_ratio >= 0.20
+                and mid_ratio >= 0.20
+            )
+            or (
+                palm_ratio >= float(self.config.fake_force_palm_threshold)
+                and mid_ratio >= float(self.config.fake_force_mid_contact_threshold)
+            )
+        )
+
+    def _apply_fake_force_coupling(self, prev_state, current_state):
+        info = {
+            "grasp_formed": False,
+            "tangent_pull": 0.0,
+            "angular_delta": 0.0,
+            "door_val_before": float(current_state.drive_dof_val),
+            "door_val_after": float(current_state.drive_dof_val),
+        }
+        if not self.config.fake_force_enabled or self.drive_dof_index is None or prev_state is None:
+            return current_state, info
+        if not self._power_grasp_established(current_state):
+            return current_state, info
+
+        tangent_dir = current_state.open_tangent_world + prev_state.open_tangent_world
+        tangent_dir = tangent_dir / max(np.linalg.norm(tangent_dir), 1e-6)
+        hand_displacement = current_state.hand_pos - prev_state.hand_pos
+        tangent_pull = float(np.dot(hand_displacement, tangent_dir))
+        info["grasp_formed"] = True
+        info["tangent_pull"] = tangent_pull
+        if tangent_pull <= float(self.config.fake_force_min_pull):
+            return current_state, info
+
+        radial = current_state.handle_center_world - current_state.hinge_origin_world
+        radial = radial - current_state.hinge_axis_world * np.dot(radial, current_state.hinge_axis_world)
+        lever_arm = max(float(np.linalg.norm(radial)), 0.01)
+        angular_delta = float(
+            np.clip(
+                (tangent_pull / lever_arm) * float(self.config.fake_force_coupling_gain),
+                0.0,
+                float(self.config.fake_force_max_delta),
+            )
+        )
+        if angular_delta <= 0.0:
+            return current_state, info
+
+        new_door_val = float(current_state.drive_dof_val + self.task_spec.open_sign * angular_delta)
+        if self.task_spec.joint_lower is not None:
+            new_door_val = max(new_door_val, float(self.task_spec.joint_lower))
+        if self.task_spec.joint_upper is not None:
+            new_door_val = min(new_door_val, float(self.task_spec.joint_upper))
+
+        dof_states = self.gym.dof_states.clone()
+        num_dof = self.gym.dof_pos.shape[1]
+        dof_states_view = dof_states.view(self.gym.num_envs, num_dof, 2)
+        dof_states_view[:, self.gym.mano_num_dofs + self.drive_dof_index, 0] = new_door_val
+        dof_states_view[:, self.gym.mano_num_dofs + self.drive_dof_index, 1] = 0.0
+        self.gym.gym.set_dof_state_tensor(self.gym.sim, gymtorch.unwrap_tensor(dof_states))
+
+        pos_action = self.gym.dof_pos.squeeze(-1).clone()
+        pos_action[:, self.gym.mano_num_dofs + self.drive_dof_index] = new_door_val
+        self.gym.gym.set_dof_position_target_tensor(self.gym.sim, gymtorch.unwrap_tensor(pos_action))
+        self.gym.run_steps(pre_steps=1, refresh_obs=True, print_step=False)
+
+        info["angular_delta"] = angular_delta
+        info["door_val_after"] = new_door_val
+        return self._extract_runtime_state(), info
 
     def reset(self, phase: Optional[str] = None, pose_noise: Optional[float] = None, rot_noise: Optional[float] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
         reset_phase = self.config.reset_phase if phase is None else phase
@@ -1084,18 +1315,24 @@ class SingleDoorResidualEnv:
         self.prev_action = self.zero_action()
         self.step_count = 0
         self.grasp_settle_counter = int(max(0, self.config.grasp_settle_steps if reset_phase != "approach" else 0))
-        self.prev_state = extract_single_door_runtime_state(
-            self.gym,
-            self.task_spec,
-            env_i=0,
-            surface_contact_thresh=0.015,
-            min_contact_points=self.config.min_contact_points,
-            contact_target_points=self.config.contact_target_points,
-        )
+        self.prev_state = self._extract_runtime_state()
+        # Tracking error at reset (zero by definition when reset matches teacher)
+        reset_teacher_pos = self.get_teacher_root_pos(step_index=0)
+        reset_teacher_rot = self.get_teacher_root_rot(step_index=0)
+        reset_teacher_qpos = self.get_teacher_qpos(step_index=0)
+        reset_tracking_pos_error = self.prev_state.hand_pos - reset_teacher_pos
+        reset_tracking_rot_error = (
+            R.from_quat(self.prev_state.hand_rot) * R.from_quat(reset_teacher_rot).inv()
+        ).as_rotvec().astype(np.float32)
+        reset_tracking_qpos_error = self.prev_state.hand_qpos - reset_teacher_qpos
+
         obs = build_single_door_observation(
             self.prev_state,
             prev_action=self.prev_action,
             contact_target_points=self.config.contact_target_points,
+            tracking_pos_error=reset_tracking_pos_error,
+            tracking_rot_error=reset_tracking_rot_error,
+            tracking_qpos_error=reset_tracking_qpos_error,
         )
         self.observation_dim = int(obs.shape[0])
         reset_teacher_targets = self.get_teacher_targets(step_index=0)
@@ -1114,6 +1351,9 @@ class SingleDoorResidualEnv:
             "non_interact_penetration_depth": float(self.prev_state.non_interact_penetration_depth),
             "handle_contact_ratio": float(self.prev_state.handle_contact_ratio),
             "non_interact_near_ratio": float(self.prev_state.non_interact_near_ratio),
+            "palm_handle_min_dist": float(self.prev_state.palm_handle_min_dist),
+            "palm_bps_min_dist": float(self.prev_state.palm_bps_min_dist),
+            "palm_bps_contact_ratio": float(self.prev_state.palm_bps_contact_ratio),
             "door_plane_violation": float(self._door_plane_violation(self.prev_state)),
             "contact_features": _to_jsonable(build_contact_feature_vector(self.prev_state.surface_contact_link_counts)),
             "contact_target": _to_jsonable(get_phase_contact_target(self.get_curriculum_phase())),
@@ -1136,57 +1376,57 @@ class SingleDoorResidualEnv:
     def step(self, action: Sequence[float]) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
         action_arr = np.asarray(action, dtype=np.float32).reshape(self.action_dim)
         teacher_targets = self.get_teacher_targets(step_index=self.step_count)
-        base_pose = self._base_pose_for_step()
-        base_qpos = self._base_qpos_for_step()
+        teacher_root_pos = self.get_teacher_root_pos(step_index=self.step_count)
+        teacher_root_rot = self.get_teacher_root_rot(step_index=self.step_count)
+        teacher_qpos = self.get_teacher_qpos(step_index=self.step_count)
+        teacher_pose = np.concatenate([teacher_root_pos, teacher_root_rot], axis=0).astype(np.float32)
         in_grasp_settle = bool(self.grasp_settle_counter > 0)
         if in_grasp_settle:
-            target_pose, target_qpos = self._apply_grasp_settle(base_pose, base_qpos, action_arr)
+            target_pose, target_qpos = self._apply_grasp_settle(teacher_pose, teacher_qpos, action_arr)
             self.grasp_settle_counter = max(0, self.grasp_settle_counter - 1)
         else:
-            target_pose = self._apply_pose_action(base_pose, action_arr[:6])
-            target_qpos = self._apply_synergy_action(base_qpos, action_arr[6:])
+            target_pose = self._apply_pose_action(teacher_pose, action_arr[:6])
+            target_qpos = self._apply_synergy_action(teacher_qpos, action_arr[6:])
 
         if self.prev_state is not None:
             target_pose = self._apply_door_plane_buffer(target_pose, self.prev_state)
 
         self._apply_hand_targets(hand_pose=target_pose, hand_qpos=target_qpos, settle_steps=max(1, self.config.action_repeat))
+        state = self._extract_runtime_state()
 
-        state = extract_single_door_runtime_state(
-            self.gym,
-            self.task_spec,
-            env_i=0,
-            surface_contact_thresh=0.015,
-            min_contact_points=self.config.min_contact_points,
-            contact_target_points=self.config.contact_target_points,
-        )
+        if state.surface_contact_min_dist < float(self.config.max_safe_penetration):
+            safe_pose = target_pose.copy()
+            safe_pose[:3] += 0.75 * float(self.config.pinch_search_depth_step) * state.handle_out_world
+            self._apply_hand_targets(hand_pose=safe_pose, hand_qpos=target_qpos, settle_steps=1)
+            state = self._extract_runtime_state()
+            target_pose = safe_pose
+
+        state, fake_force_info = self._apply_fake_force_coupling(self.prev_state, state)
+
+        # --- Tracking error computation ---
+        # Use step_count (before increment) so the teacher target matches the
+        # trajectory frame the action was meant to track.
+        tracking_pos_error = state.hand_pos - teacher_root_pos
+        tracking_rot_error_rotvec = (
+            R.from_quat(state.hand_rot) * R.from_quat(teacher_root_rot).inv()
+        ).as_rotvec().astype(np.float32)
+        tracking_qpos_error = state.hand_qpos - teacher_qpos
+        tracking_info = {
+            "tracking_pos_error": tracking_pos_error,
+            "tracking_rot_error": tracking_rot_error_rotvec,
+            "tracking_qpos_error": tracking_qpos_error,
+            "residual_action": action_arr,
+        }
+
+        # Compute reward with tracking terms (prev_state is still the old state)
         reward_terms = compute_single_door_reward(
             state=state,
             prev_state=self.prev_state,
             action=action_arr,
             prev_action=self.prev_action,
             config=self.reward_config,
+            tracking_info=tracking_info,
         )
-
-        if state.surface_contact_min_dist < float(self.config.max_safe_penetration):
-            safe_pose = target_pose.copy()
-            safe_pose[:3] += 0.75 * float(self.config.pinch_search_depth_step) * state.handle_out_world
-            self._apply_hand_targets(hand_pose=safe_pose, hand_qpos=target_qpos, settle_steps=1)
-            state = extract_single_door_runtime_state(
-                self.gym,
-                self.task_spec,
-                env_i=0,
-                surface_contact_thresh=0.015,
-                min_contact_points=self.config.min_contact_points,
-                contact_target_points=self.config.contact_target_points,
-            )
-            reward_terms = compute_single_door_reward(
-                state=state,
-                prev_state=self.prev_state,
-                action=action_arr,
-                prev_action=self.prev_action,
-                config=self.reward_config,
-            )
-            target_pose = safe_pose
 
         self.prev_state = state
         self.prev_action = action_arr.copy()
@@ -1199,15 +1439,25 @@ class SingleDoorResidualEnv:
             state,
             prev_action=self.prev_action,
             contact_target_points=self.config.contact_target_points,
+            tracking_pos_error=tracking_pos_error,
+            tracking_rot_error=tracking_rot_error_rotvec,
+            tracking_qpos_error=tracking_qpos_error,
         )
         info = {
             "step_count": int(self.step_count),
             "curriculum_phase": self.get_curriculum_phase(),
             "teacher_action": _to_jsonable(teacher_targets["teacher_action"]),
+            "teacher_pose": _to_jsonable(teacher_pose),
+            "teacher_qpos": _to_jsonable(teacher_qpos),
             "teacher_target_pose": _to_jsonable(teacher_targets["teacher_target_pose"]),
             "teacher_target_qpos": _to_jsonable(teacher_targets["teacher_target_qpos"]),
             "teacher_qpos_residual": _to_jsonable(teacher_targets["teacher_qpos_residual"]),
             "teacher_pull_hint": bool(teacher_targets["teacher_pull_hint"]),
+            "fake_force_grasp_formed": bool(fake_force_info["grasp_formed"]),
+            "fake_force_tangent_pull": float(fake_force_info["tangent_pull"]),
+            "fake_force_angular_delta": float(fake_force_info["angular_delta"]),
+            "fake_force_door_val_before": float(fake_force_info["door_val_before"]),
+            "fake_force_door_val_after": float(fake_force_info["door_val_after"]),
             "grasp_settle_active": bool(in_grasp_settle),
             "grasp_settle_counter": int(self.grasp_settle_counter),
             "contact_features": _to_jsonable(build_contact_feature_vector(state.surface_contact_link_counts)),
@@ -1224,6 +1474,9 @@ class SingleDoorResidualEnv:
             "non_interact_penetration_depth": float(state.non_interact_penetration_depth),
             "handle_contact_ratio": float(state.handle_contact_ratio),
             "non_interact_near_ratio": float(state.non_interact_near_ratio),
+            "palm_handle_min_dist": float(state.palm_handle_min_dist),
+            "palm_bps_min_dist": float(state.palm_bps_min_dist),
+            "palm_bps_contact_ratio": float(state.palm_bps_contact_ratio),
             "door_plane_violation": float(self._door_plane_violation(state)),
             "surface_contact_link_counts": dict(state.surface_contact_link_counts),
             "pinch_debug": {
