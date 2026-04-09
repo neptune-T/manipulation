@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import warnings
+
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 import torch
@@ -15,9 +17,11 @@ import torch
 PHASE_TO_ID = {
     "approach": 0,
     "touch": 1,
-    "grasp": 2,
-    "actuate": 3,
-    "success": 4,
+    "wrap": 2,
+    "grasp": 3,
+    "actuate": 4,
+    "open": 5,
+    "success": 6,
 }
 
 CONTACT_LINK_ORDER = [
@@ -537,9 +541,10 @@ class SingleDoorTaskSpec:
             )
         handle_geom_local = compute_handle_bbox_geometry(handle_bbox_local)
 
+        handle_out_world = _normalize(world_rot.apply(handle_geom_local["out"]), fallback=handle_geom_local["out"])
         handle_center_world = world_pos + world_rot.apply(handle_geom_local["center"] * scale)
         handle_front_center_world = world_pos + world_rot.apply(handle_geom_local["center_front_face"] * scale)
-        handle_out_world = _normalize(world_rot.apply(handle_geom_local["out"]), fallback=handle_geom_local["out"])
+        handle_back_center_world = handle_front_center_world - handle_geom_local["extents"][0] * scale * handle_out_world
         handle_long_world = _normalize(world_rot.apply(handle_geom_local["long"]), fallback=handle_geom_local["long"])
         handle_short_world = _normalize(world_rot.apply(handle_geom_local["short"]), fallback=handle_geom_local["short"])
 
@@ -553,6 +558,7 @@ class SingleDoorTaskSpec:
             "hinge_axis_world": hinge_axis_world.astype(np.float32),
             "handle_center_world": handle_center_world.astype(np.float32),
             "handle_front_center_world": handle_front_center_world.astype(np.float32),
+            "handle_back_center_world": handle_back_center_world.astype(np.float32),
             "handle_out_world": handle_out_world.astype(np.float32),
             "handle_long_world": handle_long_world.astype(np.float32),
             "handle_short_world": handle_short_world.astype(np.float32),
@@ -608,12 +614,15 @@ class SingleDoorRuntimeState:
     palm_handle_min_dist: float
     palm_bps_min_dist: float
     palm_bps_contact_ratio: float
+    wrap_bps_min_dist: float
+    wrap_bps_contact_ratio: float
     fingertip_handle_dists: np.ndarray
     fingertip_non_interact_dists: np.ndarray
     hinge_origin_world: np.ndarray
     hinge_axis_world: np.ndarray
     handle_center_world: np.ndarray
     handle_front_center_world: np.ndarray
+    handle_back_center_world: np.ndarray
     handle_out_world: np.ndarray
     handle_long_world: np.ndarray
     handle_short_world: np.ndarray
@@ -663,6 +672,8 @@ class SingleDoorRewardConfig:
     palm_handle_margin: float = 0.020
     palm_bps_weight: float = 2.2
     palm_bps_margin: float = 0.022
+    wrap_bps_weight: float = 3.0
+    wrap_bps_margin: float = 0.018
     # --- Tracking reward weights (Task 2) ---
     tracking_pos_weight: float = 4.0
     tracking_pos_scale: float = 20.0
@@ -699,6 +710,7 @@ def _compute_part_aware_runtime_metrics(
     }
 
     if not hasattr(gym, "contact_calc"):
+        warnings.warn("[part_metrics] gym has no contact_calc — returning defaults", stacklevel=2)
         return default_metrics
 
     cc = gym.contact_calc
@@ -707,6 +719,11 @@ def _compute_part_aware_runtime_metrics(
     non_interact_links = [name for name in cc.link_pcs.keys() if name != handle_link_name]
 
     if len(handle_links) == 0:
+        warnings.warn(
+            f"[part_metrics] handle_link_name={handle_link_name!r} not in "
+            f"cc.link_pcs={list(cc.link_pcs.keys())!r} — returning defaults",
+            stacklevel=2,
+        )
         return default_metrics
 
     try:
@@ -774,7 +791,8 @@ def _compute_part_aware_runtime_metrics(
             "fingertip_handle_dists": fingertip_handle_dists[:10],
             "fingertip_non_interact_dists": fingertip_non_interact_dists[:10],
         }
-    except Exception:
+    except Exception as exc:
+        warnings.warn(f"[part_metrics] exception: {exc!r} — returning defaults", stacklevel=2)
         return default_metrics
 
 
@@ -1008,6 +1026,15 @@ def get_phase_contact_target(phase_name: str) -> np.ndarray:
             0.05, 0.0,  0.0,   # pinky
             0.15,               # palm
         ], dtype=np.float32)
+    if phase_name == "wrap":
+        return np.asarray([
+            0.85, 0.60, 0.30,  # thumb
+            0.70, 0.55, 0.28,  # index
+            0.75, 0.60, 0.30,  # middle
+            0.65, 0.50, 0.25,  # ring
+            0.40, 0.25, 0.10,  # pinky
+            0.50,              # palm
+        ], dtype=np.float32)
     if phase_name == "grasp":
         return np.asarray([
             1.0,  0.80, 0.50,  # thumb
@@ -1046,16 +1073,52 @@ def infer_single_door_phase(
     force_closure_score: float,
     stable_contact: bool,
     success_progress: float,
+    palm_bps_contact_ratio: float = 0.0,
+    wrap_bps_contact_ratio: float = 0.0,
+    palm_handle_min_dist: float = 0.10,
+    handle_contact_ratio: float = 0.0,
 ) -> str:
+    # Detect whether handle-specific metrics are available.
+    # When the pipeline fails, palm_handle_min_dist=0.10, BPS ratios=0,
+    # handle_contact_ratio=0 — all at defaults.  In that case the only
+    # available signals (contact_score, opposition, force_closure) include
+    # door panel contacts and MUST NOT be trusted for phase advancement
+    # beyond "touch".
+    handle_signal_ok = bool(
+        palm_bps_contact_ratio > 0.0
+        or wrap_bps_contact_ratio > 0.0
+        or palm_handle_min_dist < 0.099
+        or handle_contact_ratio > 0.0
+    )
+
     if progress >= float(success_progress):
         return "success"
     if (
         max(opposition_score, force_closure_score) >= 0.40 and progress_delta > 5e-4
     ) or (stable_contact and progress_delta > 2e-4):
         return "actuate"
-    if stable_contact or force_closure_score >= 0.35 or opposition_score >= 0.40 or contact_score >= 0.55:
-        return "grasp"
-    if contact_score >= 0.20:
+
+    if handle_signal_ok:
+        # Handle metrics are live — use BPS-gated thresholds
+        if (
+            (stable_contact and wrap_bps_contact_ratio >= 0.35)
+            or (force_closure_score >= 0.38 and wrap_bps_contact_ratio >= 0.30)
+            or (opposition_score >= 0.42 and wrap_bps_contact_ratio >= 0.30)
+            or (contact_score >= 0.72 and wrap_bps_contact_ratio >= 0.25)
+        ):
+            return "grasp"
+        if (
+            (force_closure_score >= 0.18 and palm_bps_contact_ratio >= 0.15)
+            or (opposition_score >= 0.18 and palm_bps_contact_ratio >= 0.15)
+            or (contact_score >= 0.30 and palm_bps_contact_ratio >= 0.20)
+            or palm_bps_contact_ratio >= 0.30
+        ):
+            return "wrap"
+    # else: handle metrics broken — do NOT advance beyond touch,
+    # because contact_score/opposition/force_closure include door
+    # panel contacts and would produce false positives.
+
+    if contact_score >= 0.10 or palm_bps_contact_ratio >= 0.10:
         return "touch"
     return "approach"
 
@@ -1119,6 +1182,10 @@ def annotate_single_door_records(
                 and max(opposition_score, force_closure_score, envelopment_score) >= 0.45
             )
 
+        palm_bps_cr = float(record.get("palm_bps_contact_ratio", 0.0))
+        wrap_bps_cr = float(record.get("wrap_bps_contact_ratio", 0.0))
+        palm_h_dist = float(record.get("palm_handle_min_dist", 0.10))
+        handle_cr = float(record.get("handle_contact_ratio", 0.0))
         phase = infer_single_door_phase(
             progress=progress,
             progress_delta=progress_delta,
@@ -1127,6 +1194,10 @@ def annotate_single_door_records(
             force_closure_score=force_closure_score,
             stable_contact=stable_contact,
             success_progress=success_threshold,
+            palm_bps_contact_ratio=palm_bps_cr,
+            wrap_bps_contact_ratio=wrap_bps_cr,
+            palm_handle_min_dist=palm_h_dist,
+            handle_contact_ratio=handle_cr,
         )
 
         phase_histogram[phase] += 1
@@ -1155,28 +1226,120 @@ def generate_bps_basis(
     num_points: int = 64,
     radius: float = 0.08,
     seed: int = 0,
+    handle_extent_local: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Generate a fixed set of basis points on a Fibonacci sphere of given radius.
+    """Generate handle-centric BPS samples biased toward wrap-relevant regions.
 
-    Returns (num_points, 3) float32 array — deterministic for a given seed/num_points
-    so that the same basis is used across episodes and environments.
+    Local frame convention:
+    x = handle long axis
+    y = handle short axis
+    z = depth toward the door panel, with z=0 at the front face center.
+
+    The basis is a cylindrical shell around the handle plus a small front guide pad.
+    This gives the policy an explicit notion of front-side approach versus side/back
+    wrap occupancy instead of only a generic sphere around the handle.
     """
     rng = np.random.RandomState(seed)
-    # Fibonacci lattice on unit sphere for uniform coverage
-    indices = np.arange(num_points, dtype=np.float64)
-    golden_ratio = (1.0 + np.sqrt(5.0)) / 2.0
-    theta = 2.0 * np.pi * indices / golden_ratio
-    phi = np.arccos(1.0 - 2.0 * (indices + 0.5) / num_points)
-    x = np.sin(phi) * np.cos(theta)
-    y = np.sin(phi) * np.sin(theta)
-    z = np.cos(phi)
-    pts = np.stack([x, y, z], axis=-1).astype(np.float32)
-    # Add small jitter so the pattern is not perfectly regular
-    pts += rng.randn(num_points, 3).astype(np.float32) * 0.02
-    norms = np.linalg.norm(pts, axis=-1, keepdims=True)
-    norms = np.maximum(norms, 1e-8)
-    pts = pts / norms * radius
+    extent = None if handle_extent_local is None else np.asarray(handle_extent_local, dtype=np.float32).reshape(3)
+    if extent is None:
+        depth = 0.030
+        long_extent = 0.150
+        short_extent = 0.030
+    else:
+        depth = float(max(extent[0], 0.012))
+        long_extent = float(max(extent[1], 0.060))
+        short_extent = float(max(extent[2], 0.012))
+
+    center_depth = 0.5 * depth
+    rod_radius = 0.5 * max(depth, short_extent)
+    shell_radius = max(radius, rod_radius + 0.010)
+    front_guide_offset = max(0.008, 0.40 * rod_radius)
+
+    wrap_count = max(int(round(0.70 * num_points)), 8)
+    front_count = max(int(round(0.20 * num_points)), 4)
+    spine_count = max(num_points - wrap_count - front_count, 2)
+
+    x_shell = np.linspace(-0.45 * long_extent, 0.45 * long_extent, max(2, int(np.sqrt(wrap_count))))
+    theta_shell = np.linspace(-np.pi, np.pi, max(4, int(np.ceil(wrap_count / max(len(x_shell), 1)))), endpoint=False)
+    shell_pts = []
+    for x in x_shell:
+        for theta in theta_shell:
+            y = shell_radius * np.sin(theta)
+            z = center_depth + shell_radius * np.cos(theta)
+            shell_pts.append([x, y, z])
+    shell_pts = np.asarray(shell_pts, dtype=np.float32)
+
+    x_front = np.linspace(-0.40 * long_extent, 0.40 * long_extent, max(2, int(np.sqrt(front_count))))
+    y_front = np.linspace(-0.75 * shell_radius, 0.75 * shell_radius, max(2, int(np.ceil(front_count / max(len(x_front), 1)))))
+    front_pts = []
+    for x in x_front:
+        for y in y_front:
+            front_pts.append([x, y, -front_guide_offset])
+    front_pts = np.asarray(front_pts, dtype=np.float32)
+
+    x_spine = np.linspace(-0.45 * long_extent, 0.45 * long_extent, spine_count)
+    spine_pts = np.stack(
+        [
+            x_spine,
+            np.zeros_like(x_spine),
+            np.full_like(x_spine, center_depth + 0.85 * shell_radius),
+        ],
+        axis=-1,
+    ).astype(np.float32)
+
+    pts = np.concatenate([shell_pts, front_pts, spine_pts], axis=0)
+    if pts.shape[0] > num_points:
+        pick = np.linspace(0, pts.shape[0] - 1, num_points).astype(np.int64)
+        pts = pts[pick]
+    elif pts.shape[0] < num_points:
+        extra = pts[rng.choice(pts.shape[0], size=(num_points - pts.shape[0]), replace=True)]
+        pts = np.concatenate([pts, extra], axis=0)
+
+    pts = pts.astype(np.float32)
+    pts += rng.randn(*pts.shape).astype(np.float32) * 0.002
     return pts.astype(np.float32)
+
+
+def build_bps_phase_target_masks(
+    basis_points_local: np.ndarray,
+    handle_extent_local: Sequence[float],
+) -> Dict[str, np.ndarray]:
+    pts = np.asarray(basis_points_local, dtype=np.float32).reshape(-1, 3)
+    extent = np.asarray(handle_extent_local, dtype=np.float32).reshape(3)
+    depth = float(max(extent[0], 0.012))
+    short_extent = float(max(extent[2], 0.012))
+    center_depth = 0.5 * depth
+    cross_radius = 0.5 * max(depth, short_extent)
+
+    front_mask = pts[:, 2] <= float(center_depth - 0.55 * cross_radius)
+    touch_mask = np.logical_and(
+        pts[:, 2] <= float(center_depth + 0.10 * cross_radius),
+        np.abs(pts[:, 1]) <= float(1.05 * max(cross_radius, 1e-4)),
+    )
+    side_mask = np.logical_and(
+        np.abs(pts[:, 1]) >= float(0.45 * cross_radius),
+        pts[:, 2] >= float(center_depth - 0.15 * cross_radius),
+    )
+    back_mask = pts[:, 2] >= float(center_depth + 0.25 * cross_radius)
+    wrap_mask = np.logical_or(side_mask, back_mask)
+    actuate_mask = np.logical_or(back_mask, np.logical_and(side_mask, pts[:, 2] >= float(center_depth - 0.05 * cross_radius)))
+
+    masks = {
+        "approach": front_mask,
+        "touch": np.logical_or(front_mask, touch_mask),
+        "wrap": wrap_mask,
+        "grasp": wrap_mask,
+        "actuate": actuate_mask,
+        "open": actuate_mask,
+        "success": actuate_mask,
+    }
+    default_mask = np.ones((pts.shape[0],), dtype=np.bool_)
+    for key, value in list(masks.items()):
+        mask = np.asarray(value, dtype=np.bool_)
+        if not np.any(mask):
+            mask = default_mask.copy()
+        masks[key] = mask
+    return masks
 
 
 def compute_bps_features(
@@ -1224,6 +1387,7 @@ def _compute_palm_bps_runtime_metrics(
     world_geom: Dict[str, np.ndarray],
     basis_points_local: Optional[np.ndarray] = None,
     bps_target_mask: Optional[np.ndarray] = None,
+    link_filter: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     default_bps = np.zeros((0,), dtype=np.float32) if basis_points_local is None else np.full((basis_points_local.shape[0],), 0.10, dtype=np.float32)
     default_center = gym.root_states[gym.mano_actor_idxs[env_i], :3].detach().cpu().numpy().astype(np.float32)
@@ -1235,12 +1399,18 @@ def _compute_palm_bps_runtime_metrics(
         "palm_bps_features": default_bps,
     }
     if not hasattr(gym, "contact_calc"):
+        warnings.warn("[palm_bps] gym has no contact_calc — returning defaults", stacklevel=2)
         return default_metrics
 
     cc = gym.contact_calc
     handle_link_name = str(task_spec.handle_link_name)
     handle_links = [handle_link_name] if handle_link_name in cc.link_pcs else []
     if len(handle_links) == 0:
+        warnings.warn(
+            f"[palm_bps] handle_link_name={handle_link_name!r} not in "
+            f"cc.link_pcs={list(cc.link_pcs.keys())!r} — returning defaults",
+            stacklevel=2,
+        )
         return default_metrics
 
     try:
@@ -1259,17 +1429,26 @@ def _compute_palm_bps_runtime_metrics(
             hand_root_pos,
             hand_root_rot,
             hand_qpos,
-            link_filter=["palm"],
+            link_filter=["palm"] if link_filter is None else link_filter,
         )
-        palm_center_world = palm_points_world.mean(dim=1).squeeze(0)
         handle_points_world, _ = cc.compute_object_surface_points_world(
             obj_root_pos,
             obj_root_rot,
             obj_qpos,
             obj_link_filter=handle_links,
         )
-        palm_handle_dists = torch.cdist(palm_points_world, handle_points_world).min(dim=-1).values.squeeze(0)
-        palm_handle_min_dist = float(palm_handle_dists.min().item())
+        palm_to_handle = torch.cdist(palm_points_world, handle_points_world)
+        palm_handle_dists = palm_to_handle.min(dim=-1).values.squeeze(0)
+        if palm_handle_dists.numel() > 0:
+            patch_count = int(np.clip(max(16, palm_handle_dists.shape[0] // 4), 1, palm_handle_dists.shape[0]))
+            patch_idx = torch.topk(palm_handle_dists, k=patch_count, largest=False).indices
+            palm_patch_world = palm_points_world[:, patch_idx, :]
+        else:
+            palm_patch_world = palm_points_world
+
+        palm_center_world = palm_patch_world.mean(dim=1).squeeze(0)
+        palm_handle_patch_dists = torch.cdist(palm_patch_world, handle_points_world).min(dim=-1).values.squeeze(0)
+        palm_handle_min_dist = float(palm_handle_patch_dists.min().item()) if palm_handle_patch_dists.numel() > 0 else 0.10
 
         if basis_points_local is None or basis_points_local.size == 0:
             return {
@@ -1288,7 +1467,7 @@ def _compute_palm_bps_runtime_metrics(
             handle_out_world=world_geom["handle_out_world"],
         )
         basis_points_world = torch.tensor(basis_points_world_np, dtype=torch.float32, device=gym.device).unsqueeze(0)
-        palm_bps_dists = torch.cdist(basis_points_world, palm_points_world).min(dim=-1).values.squeeze(0)
+        palm_bps_dists = torch.cdist(basis_points_world, palm_patch_world).min(dim=-1).values.squeeze(0)
 
         if bps_target_mask is not None and np.any(bps_target_mask):
             mask_t = torch.tensor(np.asarray(bps_target_mask, dtype=np.bool_), dtype=torch.bool, device=gym.device)
@@ -1305,8 +1484,19 @@ def _compute_palm_bps_runtime_metrics(
             "palm_bps_contact_ratio": palm_bps_contact_ratio,
             "palm_bps_features": palm_bps_dists.detach().cpu().numpy().astype(np.float32),
         }
-    except Exception:
+    except Exception as exc:
+        warnings.warn(f"[palm_bps] exception: {exc!r} — returning defaults", stacklevel=2)
         return default_metrics
+
+
+def _reward_from_bps_distance(min_dist: float, contact_ratio: float, margin: float) -> float:
+    return float(
+        np.exp(
+            -max(0.0, float(min_dist) - float(margin))
+            / max(float(margin), 1e-6)
+        )
+        * (0.25 + 0.75 * float(contact_ratio))
+    )
 
 
 def extract_single_door_runtime_state(
@@ -1321,7 +1511,9 @@ def extract_single_door_runtime_state(
     handle_bps_features: Optional[np.ndarray] = None,
     bps_basis_points: Optional[np.ndarray] = None,
     bps_target_mask: Optional[np.ndarray] = None,
+    wrap_bps_target_mask: Optional[np.ndarray] = None,
     contact_obj_urdf_path: Optional[str] = None,
+    world_geom_override: Optional[Dict[str, np.ndarray]] = None,
 ) -> SingleDoorRuntimeState:
     obj_urdf_path = task_spec.urdf_path if contact_obj_urdf_path is None else str(contact_obj_urdf_path)
     if hasattr(gym, "_ensure_contact_calc"):
@@ -1364,12 +1556,15 @@ def extract_single_door_runtime_state(
     obj_world_pos = gym.arti_init_obj_pos_list[env_i]
     obj_world_rot = gym.arti_init_obj_rot_list[env_i]
     obj_scale = gym.cfgs.get("asset", {}).get("arti_obj_scale", 1.0)
-    world_geom = task_spec.world_geometry(
-        obj_world_pos=obj_world_pos,
-        obj_world_rot=obj_world_rot,
-        obj_scale=obj_scale,
-        drive_joint_qpos=drive_dof_val,
-    )
+    if world_geom_override is None:
+        world_geom = task_spec.world_geometry(
+            obj_world_pos=obj_world_pos,
+            obj_world_rot=obj_world_rot,
+            obj_scale=obj_scale,
+            drive_joint_qpos=drive_dof_val,
+        )
+    else:
+        world_geom = {k: np.asarray(v, dtype=np.float32).copy() for k, v in world_geom_override.items()}
     part_metrics = _compute_part_aware_runtime_metrics(
         gym=gym,
         task_spec=task_spec,
@@ -1384,11 +1579,28 @@ def extract_single_door_runtime_state(
         world_geom=world_geom,
         basis_points_local=bps_basis_points,
         bps_target_mask=bps_target_mask,
+        link_filter=["palm"],
+    )
+    wrap_bps_metrics = _compute_palm_bps_runtime_metrics(
+        gym=gym,
+        task_spec=task_spec,
+        env_i=env_i,
+        world_geom=world_geom,
+        basis_points_local=bps_basis_points,
+        bps_target_mask=wrap_bps_target_mask,
+        link_filter=[
+            "palm", 
+            "thumb2", "thumb3", 
+            "index2", "index3", 
+            "middle2", "middle3", 
+            "ring2", "ring3", 
+            "pinky2", "pinky3"
+        ],
     )
     
     # 计算当前手掌有没有穿过门板的数学平面
     plane_normal = world_geom["handle_out_world"]
-    plane_point = world_geom["handle_front_center_world"] - 0.005 * plane_normal
+    plane_point = world_geom["handle_back_center_world"] - 0.005 * plane_normal
     signed_plane_dist = float(np.dot(np.asarray(palm_bps_metrics["palm_center_world"], dtype=np.float32) - plane_point, plane_normal))
     door_plane_violation = float(max(0.0, -signed_plane_dist))
 
@@ -1422,12 +1634,15 @@ def extract_single_door_runtime_state(
         palm_handle_min_dist=float(palm_bps_metrics["palm_handle_min_dist"]),
         palm_bps_min_dist=float(palm_bps_metrics["palm_bps_min_dist"]),
         palm_bps_contact_ratio=float(palm_bps_metrics["palm_bps_contact_ratio"]),
+        wrap_bps_min_dist=float(wrap_bps_metrics["palm_bps_min_dist"]),
+        wrap_bps_contact_ratio=float(wrap_bps_metrics["palm_bps_contact_ratio"]),
         fingertip_handle_dists=np.asarray(part_metrics["fingertip_handle_dists"], dtype=np.float32),
         fingertip_non_interact_dists=np.asarray(part_metrics["fingertip_non_interact_dists"], dtype=np.float32),
         hinge_origin_world=world_geom["hinge_origin_world"],
         hinge_axis_world=world_geom["hinge_axis_world"],
         handle_center_world=world_geom["handle_center_world"],
         handle_front_center_world=world_geom["handle_front_center_world"],
+        handle_back_center_world=world_geom["handle_back_center_world"],
         handle_out_world=world_geom["handle_out_world"],
         handle_long_world=world_geom["handle_long_world"],
         handle_short_world=world_geom["handle_short_world"],
@@ -1494,6 +1709,8 @@ def build_single_door_observation(
             float(state.palm_handle_min_dist),
             float(state.palm_bps_min_dist),
             float(state.palm_bps_contact_ratio),
+            float(state.wrap_bps_min_dist),
+            float(state.wrap_bps_contact_ratio),
         ],
         dtype=np.float32,
     )
@@ -1556,6 +1773,8 @@ def compute_single_door_reward(
     tracking_info: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, float]:
     cfg = SingleDoorRewardConfig() if config is None else config
+    teacher_phase = None if tracking_info is None else str(tracking_info.get("teacher_phase", "grasp"))
+    skip_to_pull = False if tracking_info is None else bool(tracking_info.get("skip_to_pull", False))
 
     thumb_contact = float(state.surface_contact_link_counts.get("thumb3", 0))
     finger_contacts = np.asarray(
@@ -1575,13 +1794,19 @@ def compute_single_door_reward(
 
     reach_dist = float(np.linalg.norm(state.palm_center_world - state.handle_front_center_world))
     raw_reach_reward = float(np.exp(-cfg.reach_scale * reach_dist))
-    reach_reward = float(raw_reach_reward * (0.2 + 0.8 * pinch_gate))
+    reach_gate = 0.2 + 0.8 * pinch_gate
+    if teacher_phase in {"approach", "touch"}:
+        reach_gate = max(reach_gate, 0.60)
+    reach_reward = float(raw_reach_reward * reach_gate)
 
     hand_rot_mat = R.from_quat(state.hand_rot).as_matrix().astype(np.float32)
     align_long = 0.5 * (1.0 + float(np.dot(hand_rot_mat[:, 0], state.handle_long_world)))
     align_out = 0.5 * (1.0 + float(np.dot(hand_rot_mat[:, 2], -state.handle_out_world)))
     raw_align_reward = float(0.5 * (align_long + align_out))
-    align_reward = float(raw_align_reward * (0.25 + 0.75 * pinch_gate))
+    align_gate = 0.25 + 0.75 * pinch_gate
+    if teacher_phase in {"approach", "touch"}:
+        align_gate = max(align_gate, 0.45)
+    align_reward = float(raw_align_reward * align_gate)
 
     contact_reward = compute_contact_score(state.surface_contact_link_counts, target_points=cfg.contact_target_points)
     opposition_reward = compute_opposition_score(state.surface_contact_link_counts, target_points=cfg.contact_target_points)
@@ -1617,23 +1842,50 @@ def compute_single_door_reward(
             / max(float(cfg.palm_handle_margin), 1e-6)
         )
     )
-    palm_bps_reward = float(
-        np.exp(
-            -max(0.0, state.palm_bps_min_dist - float(cfg.palm_bps_margin))
-            / max(float(cfg.palm_bps_margin), 1e-6)
-        )
-        * (0.25 + 0.75 * float(state.palm_bps_contact_ratio))
+    palm_bps_reward = _reward_from_bps_distance(
+        min_dist=state.palm_bps_min_dist,
+        contact_ratio=state.palm_bps_contact_ratio,
+        margin=cfg.palm_bps_margin,
+    )
+    wrap_bps_reward = _reward_from_bps_distance(
+        min_dist=state.wrap_bps_min_dist,
+        contact_ratio=state.wrap_bps_contact_ratio,
+        margin=cfg.wrap_bps_margin,
     )
     part_non_interact_penalty = float(
         state.non_interact_repulsion_penalty + 2.0 * state.non_interact_penetration_depth
     )
 
     progress_delta = 0.0 if prev_state is None else float(state.progress - prev_state.progress)
-    progress_gate = _clip_unit(
-        (
-            max(opposition_reward, pinch_reward, force_closure_reward) - cfg.progress_gate_threshold
-        ) / max(1e-6, 1.0 - cfg.progress_gate_threshold)
+    # Hard gate: progress/tangent rewards are strictly zero until the hand
+    # has established a proper wrap (BPS coverage) AND force closure.
+    # This prevents the agent from learning to yank with a marginal grasp.
+    grasp_quality = max(opposition_reward, pinch_reward, force_closure_reward)
+    soft_progress_gate = _clip_unit(
+        (grasp_quality - cfg.progress_gate_threshold) / max(1e-6, 1.0 - cfg.progress_gate_threshold)
     )
+    if skip_to_pull:
+        # In skip_to_pull mode, bypass grasp quality requirements entirely —
+        # the hand relies on mesh intersection geometry to hook the handle.
+        hard_grasp_ok = True
+    else:
+        handle_metrics_ok = bool(
+            state.palm_handle_min_dist < 0.099
+            or state.palm_bps_contact_ratio > 0.0
+            or state.wrap_bps_contact_ratio > 0.0
+            or state.handle_contact_ratio > 0.0
+        )
+        if handle_metrics_ok:
+            hard_grasp_ok = bool(
+                force_closure_reward >= cfg.force_closure_gate_threshold
+                and state.wrap_bps_contact_ratio >= 0.25
+            )
+        else:
+            # Handle metrics unavailable — fall back to force closure alone
+            hard_grasp_ok = bool(
+                force_closure_reward >= cfg.force_closure_gate_threshold
+            )
+    progress_gate = float(soft_progress_gate) if hard_grasp_ok else 0.0
     progress_reward = float(max(0.0, progress_delta) * progress_gate)
 
     tangent_speed = float(np.dot(state.hand_lin_vel, state.open_tangent_world))
@@ -1692,13 +1944,53 @@ def compute_single_door_reward(
         qpos_err = np.asarray(tracking_info["tracking_qpos_error"], dtype=np.float32)
         residual_act = np.asarray(tracking_info["residual_action"], dtype=np.float32)
 
-        tracking_gate = _clip_unit(
-            max(
-                0.55 * palm_handle_reward + 0.45 * palm_bps_reward,
-                0.60 * contact_reward + 0.40 * force_closure_reward,
-                0.50 * state.palm_bps_contact_ratio + 0.50 * state.handle_contact_ratio,
-            )
+        # Detect when handle-specific metrics are at default fallback values,
+        # which means the handle localization pipeline failed silently.
+        # contact_reward/opposition/force_closure include door panel contacts
+        # so when handle metrics are broken, these scores are NOT trustworthy.
+        handle_metrics_live = bool(
+            state.palm_handle_min_dist < 0.099
+            or state.palm_bps_contact_ratio > 0.0
+            or state.wrap_bps_contact_ratio > 0.0
+            or state.handle_contact_ratio > 0.0
         )
+
+        if skip_to_pull:
+            # In skip_to_pull mode, tracking gate is based purely on
+            # trajectory following quality — grasp metrics don't matter.
+            tracking_gate = 1.0
+        elif handle_metrics_live:
+            tracking_gate = _clip_unit(
+                max(
+                    0.35 * palm_handle_reward + 0.25 * palm_bps_reward + 0.40 * wrap_bps_reward,
+                    0.45 * contact_reward + 0.30 * force_closure_reward + 0.25 * envelopment_reward,
+                    0.35 * state.palm_bps_contact_ratio + 0.65 * state.wrap_bps_contact_ratio,
+                )
+            )
+        else:
+            # ALL handle metrics broken — cap tracking_gate to a minimal
+            # baseline.  Do NOT use contact/opposition/force_closure as
+            # they are inflated by door panel contacts.
+            tracking_gate = 0.10
+
+        if teacher_phase in {"approach", "touch"}:
+            if handle_metrics_live:
+                approach_gate = max(
+                    raw_reach_reward,
+                    float(np.exp(-10.0 * state.palm_bps_min_dist)),
+                    float(np.exp(-12.0 * state.palm_handle_min_dist)),
+                )
+                tracking_gate = max(tracking_gate, 0.45 * approach_gate)
+            # When BPS unavailable, do NOT inflate tracking_gate from
+            # raw_reach or default palm_handle_min_dist=0.10
+        elif teacher_phase in {"wrap", "grasp", "actuate", "open", "success"}:
+            if handle_metrics_live:
+                wrap_gate = max(
+                    wrap_bps_reward,
+                    float(np.exp(-14.0 * state.wrap_bps_min_dist)),
+                    float(state.wrap_bps_contact_ratio),
+                )
+                tracking_gate = max(tracking_gate, 0.65 * wrap_gate)
         tracking_gate = float(tracking_gate ** float(cfg.tracking_gate_power))
 
         # exp(-scale * ||error||) gives smooth [0,1] reward, but only once the hand
@@ -1730,6 +2022,7 @@ def compute_single_door_reward(
         + cfg.part_handle_reward_weight * part_handle_reward
         + cfg.palm_handle_weight * palm_handle_reward
         + cfg.palm_bps_weight * palm_bps_reward
+        + cfg.wrap_bps_weight * wrap_bps_reward
         + 0.75 * pinch_reward
         + cfg.progress_weight * progress_reward
         + cfg.tangent_weight * tangent_reward
@@ -1768,6 +2061,7 @@ def compute_single_door_reward(
         "part_handle": float(part_handle_reward),
         "palm_handle": float(palm_handle_reward),
         "palm_bps": float(palm_bps_reward),
+        "wrap_bps": float(wrap_bps_reward),
         "part_non_interact_penalty": float(part_non_interact_penalty),
         "handle_min_dist": float(state.handle_min_dist),
         "non_interact_min_dist": float(state.non_interact_min_dist),
@@ -1777,6 +2071,8 @@ def compute_single_door_reward(
         "palm_handle_min_dist": float(state.palm_handle_min_dist),
         "palm_bps_min_dist": float(state.palm_bps_min_dist),
         "palm_bps_contact_ratio": float(state.palm_bps_contact_ratio),
+        "wrap_bps_min_dist": float(state.wrap_bps_min_dist),
+        "wrap_bps_contact_ratio": float(state.wrap_bps_contact_ratio),
         "door_plane_violation": float(state.door_plane_violation),
         "pinch": float(pinch_reward),
         "pinch_gate": float(pinch_gate),

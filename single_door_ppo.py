@@ -146,7 +146,7 @@ def main():
     parser.add_argument("--save-dir", type=str, default="output/single_door_ppo")
     parser.add_argument("--total-updates", type=int, default=500)
     parser.add_argument("--rollout-steps", type=int, default=256)
-    parser.add_argument("--reset-phase", type=str, default="grasp", choices=["approach", "grasp"])
+    parser.add_argument("--reset-phase", type=str, default="approach", choices=["approach", "touch", "wrap", "grasp", "actuate"])
     parser.add_argument("--reset-pose-noise", type=float, default=0.002)
     parser.add_argument("--reset-rot-noise", type=float, default=0.02)
     parser.add_argument("--policy-init-std", type=float, default=0.40)
@@ -161,7 +161,9 @@ def main():
     parser.add_argument("--entropy-coef", type=float, default=0.008)
     parser.add_argument("--contact-aux-coef", type=float, default=0.35)
     parser.add_argument("--target-kl", type=float, default=0.015)
-    parser.add_argument("--curriculum-enabled", action="store_true", default=False)
+    parser.add_argument("--curriculum-enabled", dest="curriculum_enabled", action="store_true")
+    parser.add_argument("--no-curriculum-enabled", dest="curriculum_enabled", action="store_false")
+    parser.set_defaults(curriculum_enabled=True)
     parser.add_argument("--wandb", action="store_true", default=False)
     parser.add_argument("--wandb-project", type=str, default="gapartnet-hoi")
     parser.add_argument("--wandb-name", type=str, default="")
@@ -261,6 +263,7 @@ def main():
             stable_contact_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
             palm_handle_dist_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
             palm_bps_contact_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
+            wrap_bps_contact_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
             tracking_gate_buf = np.zeros((ppo_cfg.rollout_steps, num_envs), dtype=np.float32)
 
             for step in range(ppo_cfg.rollout_steps):
@@ -300,6 +303,7 @@ def main():
                 stable_contact_buf[step] = np.atleast_1d(np.asarray(info["surface_contact_stable"], dtype=np.float32))
                 palm_handle_dist_buf[step] = np.atleast_1d(np.asarray(info["palm_handle_min_dist"], dtype=np.float32))
                 palm_bps_contact_buf[step] = np.atleast_1d(np.asarray(info["palm_bps_contact_ratio"], dtype=np.float32))
+                wrap_bps_contact_buf[step] = np.atleast_1d(np.asarray(info["wrap_bps_contact_ratio"], dtype=np.float32))
                 tracking_gate_buf[step] = np.atleast_1d(np.asarray(info["reward_terms"]["tracking_gate"], dtype=np.float32))
 
                 obs = np.asarray(next_obs, dtype=np.float32)
@@ -434,6 +438,7 @@ def main():
             rollout_progress = float(np.mean(progress_buf))
             rollout_palm_handle_dist = float(np.mean(palm_handle_dist_buf))
             rollout_palm_bps_contact = float(np.mean(palm_bps_contact_buf))
+            rollout_wrap_bps_contact = float(np.mean(wrap_bps_contact_buf))
             rollout_tracking_gate = float(np.mean(tracking_gate_buf))
             tf_recent = history[-int(max(1, ppo_cfg.teacher_forcing_window)) :]
             tf_recent_success = float(np.mean([float(item["success"]) for item in tf_recent])) if tf_recent else 0.0
@@ -462,7 +467,7 @@ def main():
                 f"update={update:04d} avg_return={avg_return:.3f} "
                 f"avg_progress={avg_progress:.4f} success_rate={success_rate:.2f} "
                 f"rollout_contact={rollout_contact_rate:.2f} rollout_prog={rollout_progress:.4f} "
-                f"palm_dist={rollout_palm_handle_dist:.4f} palm_bps={rollout_palm_bps_contact:.2f} track_gate={rollout_tracking_gate:.2f} "
+                f"palm_dist={rollout_palm_handle_dist:.4f} palm_bps={rollout_palm_bps_contact:.2f} wrap_bps={rollout_wrap_bps_contact:.2f} track_gate={rollout_tracking_gate:.2f} "
                 f"bc={last_stats.get('bc_loss', 0.0):.4f} contact_aux={last_stats.get('contact_aux_loss', 0.0):.4f} "
                 f"tf={ppo_cfg.teacher_forcing_coef:.2f} bc_coef={ppo_cfg.bc_coef:.3f} tf_recent={tf_recent_success:.2f} "
                 f"phase={env.get_curriculum_phase()}"
@@ -477,6 +482,7 @@ def main():
                     "rollout_progress": float(rollout_progress),
                     "rollout_palm_handle_dist": float(rollout_palm_handle_dist),
                     "rollout_palm_bps_contact": float(rollout_palm_bps_contact),
+                    "rollout_wrap_bps_contact": float(rollout_wrap_bps_contact),
                     "rollout_tracking_gate": float(rollout_tracking_gate),
                     "bc_coef": float(ppo_cfg.bc_coef),
                     "bc_recent_success": float(tf_recent_success),

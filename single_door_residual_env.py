@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import struct
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Sequence, Tuple
@@ -21,12 +22,17 @@ try:
         SingleDoorRewardConfig,
         SingleDoorTaskSpec,
         build_single_door_observation,
+        build_bps_phase_target_masks,
         build_contact_feature_vector,
         compute_bps_features,
+        compute_contact_score,
+        compute_force_closure_score,
+        compute_opposition_score,
         compute_single_door_reward,
         extract_single_door_runtime_state,
         generate_bps_basis,
         get_phase_contact_target,
+        infer_single_door_phase,
         select_articulation_task,
         select_single_door_task,
     )
@@ -40,12 +46,17 @@ except ImportError:
         SingleDoorRewardConfig,
         SingleDoorTaskSpec,
         build_single_door_observation,
+        build_bps_phase_target_masks,
         build_contact_feature_vector,
         compute_bps_features,
+        compute_contact_score,
+        compute_force_closure_score,
+        compute_opposition_score,
         compute_single_door_reward,
         extract_single_door_runtime_state,
         generate_bps_basis,
         get_phase_contact_target,
+        infer_single_door_phase,
         select_articulation_task,
         select_single_door_task,
     )
@@ -77,49 +88,40 @@ MANO_Q_LIMITS = np.asarray(
     dtype=np.float32,
 )
 
-# Power grasp presets: C-shaped hand with high MCP/PIP flexion for full wrap.
+# Power grasp presets: C-shaped hand with clear finger spread and deeper flexion
+# so the teacher demonstrates envelopment instead of a parallel pinch.
 # Joint order per finger: [abduction, MCP_flexion, PIP_flexion, DIP_flexion]
 # Thumb order: [j_thumb1y, j_thumb1z, j_thumb2, j_thumb3]
 PINCH_PRESET_QPOS = np.asarray(
     [
-        # index:  abd,   MCP,  PIP,  DIP  — deep wrap
-        0.00,  0.95, 1.10, 0.50,
-        # middle
-        0.00,  1.05, 1.20, 0.50,
-        # pinky
-        0.00,  0.90, 1.00, 0.40,
-        # ring
-        0.00,  1.00, 1.10, 0.50,
-        # thumb — opposed, wrapping inward
-        1.30,  0.30, 0.70, 0.40,
+        0.16,  1.20, 1.42, 0.84,
+        0.06,  1.26, 1.48, 0.90,
+       -0.26,  1.10, 1.34, 0.86,
+       -0.18,  1.18, 1.42, 0.92,
+        1.54,  0.50, 1.08, 0.78,
     ],
     dtype=np.float32,
 )
 
 PINCH_ACTUATE_QPOS = np.asarray(
     [
-        0.00,  1.05, 1.20, 0.60,
-        0.00,  1.15, 1.30, 0.60,
-        0.00,  1.00, 1.10, 0.50,
-        0.00,  1.10, 1.20, 0.60,
-        1.40,  0.35, 0.80, 0.50,
+        0.18,  1.30, 1.56, 0.98,
+        0.08,  1.36, 1.62, 1.02,
+       -0.30,  1.20, 1.46, 0.96,
+       -0.22,  1.30, 1.54, 1.02,
+        1.68,  0.60, 1.24, 0.92,
     ],
     dtype=np.float32,
 )
 
-# Relaxed C-shape for initial approach — fingers moderately curled, ready to wrap
+# Relaxed C-shape for initial approach — fingers already spread around the rod.
 PINCH_TOUCH_QPOS = np.asarray(
     [
-        # index
-        0.00,  0.55, 0.65, 0.30,
-        # middle
-        0.00,  0.60, 0.70, 0.30,
-        # pinky
-        0.00,  0.50, 0.55, 0.20,
-        # ring
-        0.00,  0.55, 0.65, 0.28,
-        # thumb
-        1.00,  0.15, 0.40, 0.20,
+        0.14,  0.82, 0.98, 0.56,
+        0.05,  0.88, 1.04, 0.60,
+       -0.22,  0.76, 0.90, 0.50,
+       -0.14,  0.84, 0.98, 0.58,
+        1.26,  0.32, 0.72, 0.42,
     ],
     dtype=np.float32,
 )
@@ -155,6 +157,81 @@ def _to_jsonable(value: Any) -> Any:
 
 def _matrix_to_quaternion_xyzw(rot_mat: np.ndarray) -> np.ndarray:
     return R.from_matrix(rot_mat).as_quat().astype(np.float32)
+
+
+def _load_binary_stl_vertices(stl_path: str) -> np.ndarray:
+    if not os.path.exists(stl_path):
+        return np.zeros((0, 3), dtype=np.float32)
+    with open(stl_path, "rb") as handle:
+        handle.read(80)
+        tri_count_bytes = handle.read(4)
+        if len(tri_count_bytes) != 4:
+            return np.zeros((0, 3), dtype=np.float32)
+        tri_count = struct.unpack("<I", tri_count_bytes)[0]
+        data = handle.read()
+    verts = []
+    for tri_idx in range(int(tri_count)):
+        offset = tri_idx * 50
+        if offset + 50 > len(data):
+            break
+        vals = struct.unpack("<12fH", data[offset : offset + 50])
+        verts.extend(
+            [
+                (vals[3], vals[4], vals[5]),
+                (vals[6], vals[7], vals[8]),
+                (vals[9], vals[10], vals[11]),
+            ]
+        )
+    if len(verts) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    return np.asarray(verts, dtype=np.float32)
+
+
+def _estimate_mano_palm_reference_local(repo_root: str) -> Tuple[np.ndarray, np.ndarray]:
+    palm_mesh_path = os.path.join(repo_root, "urdf", "meshes", "palm.stl")
+    palm_vertices = _load_binary_stl_vertices(palm_mesh_path)
+    if palm_vertices.shape[0] == 0:
+        fallback = np.array([-0.04, 0.0, 0.0], dtype=np.float32)
+        return fallback.copy(), fallback.copy()
+
+    palm_center_local = palm_vertices.mean(axis=0).astype(np.float32)
+    x_thresh = float(np.quantile(palm_vertices[:, 0], 0.30))
+    palm_patch = palm_vertices[palm_vertices[:, 0] <= x_thresh]
+    if palm_patch.shape[0] < 32:
+        palm_patch = palm_vertices
+    palm_patch_local = palm_patch.mean(axis=0).astype(np.float32)
+    return palm_center_local, palm_patch_local
+
+
+def _slerp_quat_xyzw(q0: Sequence[float], q1: Sequence[float], t: float) -> np.ndarray:
+    q0_arr = np.asarray(q0, dtype=np.float64)
+    q1_arr = np.asarray(q1, dtype=np.float64)
+    q0_arr = q0_arr / max(np.linalg.norm(q0_arr), 1e-8)
+    q1_arr = q1_arr / max(np.linalg.norm(q1_arr), 1e-8)
+    dot = float(np.dot(q0_arr, q1_arr))
+    if dot < 0.0:
+        q1_arr = -q1_arr
+        dot = -dot
+    dot = float(np.clip(dot, -1.0, 1.0))
+    if dot > 0.9995:
+        quat = q0_arr + float(t) * (q1_arr - q0_arr)
+        return (quat / max(np.linalg.norm(quat), 1e-8)).astype(np.float32)
+    theta_0 = float(np.arccos(dot))
+    sin_theta_0 = float(np.sin(theta_0))
+    theta_t = theta_0 * float(t)
+    s0 = float(np.sin(theta_0 - theta_t) / max(sin_theta_0, 1e-8))
+    s1 = float(np.sin(theta_t) / max(sin_theta_0, 1e-8))
+    quat = s0 * q0_arr + s1 * q1_arr
+    return (quat / max(np.linalg.norm(quat), 1e-8)).astype(np.float32)
+
+
+def _interpolate_pose(pose_a: Sequence[float], pose_b: Sequence[float], fraction: float) -> np.ndarray:
+    frac = float(np.clip(fraction, 0.0, 1.0))
+    pose_a_arr = np.asarray(pose_a, dtype=np.float32).reshape(7)
+    pose_b_arr = np.asarray(pose_b, dtype=np.float32).reshape(7)
+    pos = (1.0 - frac) * pose_a_arr[:3] + frac * pose_b_arr[:3]
+    quat = _slerp_quat_xyzw(pose_a_arr[3:7], pose_b_arr[3:7], frac)
+    return np.concatenate([pos.astype(np.float32), quat.astype(np.float32)], axis=0)
 
 
 def _build_handle_point_cloud_from_collision_mesh(
@@ -269,7 +346,7 @@ class SingleDoorResidualConfig:
     num_envs: int = 1
     task_index: int = 0
     door_index: int = 0
-    reset_phase: str = "grasp"
+    reset_phase: str = "approach"
     max_episode_steps: int = 120
     action_repeat: int = 2
     settle_steps: int = 6
@@ -290,13 +367,18 @@ class SingleDoorResidualConfig:
     reset_rot_noise: float = 0.0
     stabilize_on_reset: bool = True
     curriculum_enabled: bool = True
-    curriculum_levels: Tuple[str, ...] = ("grasp", "actuate", "open")
+    curriculum_levels: Tuple[str, ...] = ("approach", "touch", "wrap", "grasp", "actuate", "open")
     curriculum_success_threshold: float = 0.8
     curriculum_window: int = 20
+    approach_steps: int = 16
+    touch_steps: int = 12
+    wrap_steps: int = 12
+    grasp_hold_steps: int = 8
     pinch_search_enabled: bool = True
     pinch_search_lateral_step: float = 0.008
     pinch_search_depth_step: float = 0.003
     pinch_search_lateral_trials: int = 5
+    pinch_search_pitch_deg: float = 20.0
     pinch_search_yaw_deg: float = 18.0
     pinch_search_roll_deg: float = 12.0
     wrist_rotation_lock: float = 0.85
@@ -315,6 +397,13 @@ class SingleDoorResidualConfig:
     fake_force_min_pull: float = 5e-4
     bps_num_points: int = 64
     bps_radius: float = 0.08
+    use_optimized_qpos: bool = True
+    arti_obj_dof_damping: float = 2.0
+    arti_obj_dof_friction: float = 0.0
+    # Skip wrap/grasp phases entirely: reset at anchor pose, enter
+    # actuate immediately, and let the intersection geometry hook the
+    # handle during the pull trajectory.
+    skip_to_pull: bool = False
 
 
 class SingleDoorResidualEnv:
@@ -339,9 +428,12 @@ class SingleDoorResidualEnv:
         self.object_lower = np.asarray(self.gym.arti_obj_dof_props["lower"], dtype=np.float32).copy()
         self.object_upper = np.asarray(self.gym.arti_obj_dof_props["upper"], dtype=np.float32).copy()
         self.synergy_matrix = self._build_synergy_matrix()
+        self.palm_center_local, self.palm_patch_local = _estimate_mano_palm_reference_local(self.repo_root)
         self.open_qpos = np.zeros(20, dtype=np.float32)
         self.closed_qpos = self._clip_hand_qpos(self.synergy_to_qpos(np.array([0.6, 0.9, 0.8, 0.6, 0.0], dtype=np.float32)))
         self.pregrasp_pose = np.zeros(7, dtype=np.float32)
+        self.touch_pose = np.zeros(7, dtype=np.float32)
+        self.wrap_pose = np.zeros(7, dtype=np.float32)
         self.anchor_pose = np.zeros(7, dtype=np.float32)
         self.anchor_qpos = self.closed_qpos.copy()
         self.demo_traj = np.zeros((1, 7), dtype=np.float32)
@@ -358,7 +450,13 @@ class SingleDoorResidualEnv:
         self.handle_point_cloud_np: Optional[np.ndarray] = None
         self.bps_basis_points: Optional[np.ndarray] = None
         self.bps_palm_target_mask: Optional[np.ndarray] = None
+        self.bps_wrap_target_mask: Optional[np.ndarray] = None
+        self.bps_phase_target_masks: Dict[str, np.ndarray] = {}
         self.cached_bps_features: Optional[np.ndarray] = None
+        self.teacher_world_geom: Optional[Dict[str, np.ndarray]] = None
+        self.handle_geom_correction: Optional[Dict[str, np.ndarray]] = None
+        self.active_phase: str = str(self.config.reset_phase)
+        self.phase_entry_step: int = 0
         self._prepare_teacher()
 
     def _resolve_asset_paths(self, asset_dir: str) -> Tuple[str, str, str]:
@@ -433,6 +531,8 @@ class SingleDoorResidualEnv:
         if self.task_spec.joint_type in ["revolute", "continuous"]:
             cfgs["asset"]["arti_shape_contact_offset"] = 0.005
             cfgs["asset"]["arti_shape_thickness"] = 0.02
+            cfgs["asset"]["arti_obj_dof_damping"] = float(self.config.arti_obj_dof_damping)
+            cfgs["asset"]["arti_obj_dof_friction"] = float(self.config.arti_obj_dof_friction)
             # Slim down MANO collision bodies to prevent ghost-overlap with the
             # door panel.  Smaller contact_offset + thickness gives the fingers
             # enough physical clearance to wrap around the handle without the
@@ -459,13 +559,14 @@ class SingleDoorResidualEnv:
     def _build_synergy_matrix(self) -> np.ndarray:
         matrix = np.zeros((20, 5), dtype=np.float32)
         # 0: 四指整体朝向把手闭合（近端+中段）
-        matrix[[1, 5, 9, 13], 0] = 0.30
-        matrix[[2, 6, 10, 14], 0] = 0.60
-        matrix[[3, 7, 11, 15], 0] = 0.20
+        matrix[[1, 5, 9, 13], 0] = 0.42
+        matrix[[2, 6, 10, 14], 0] = 0.78
+        matrix[[3, 7, 11, 15], 0] = 0.34
 
-        # 1: 四指远端进一步夹紧，形成类似平行夹爪内侧面
-        matrix[[2, 6, 10, 14], 1] = 0.25
-        matrix[[3, 7, 11, 15], 1] = 0.75
+        # 1: 四指远端进一步卷曲，强化 hook/C-grasp 而不是平行夹爪
+        matrix[[1, 5, 9, 13], 1] = 0.12
+        matrix[[2, 6, 10, 14], 1] = 0.30
+        matrix[[3, 7, 11, 15], 1] = 0.82
 
         # 2: 拇指对向闭合
         matrix[16, 2] = 0.65
@@ -473,16 +574,17 @@ class SingleDoorResidualEnv:
         matrix[18, 2] = 0.60
         matrix[19, 2] = 0.75
 
-        # 3: 拇指根部摆位，帮助从另一侧卡住把手
-        matrix[16, 3] = 0.55
-        matrix[17, 3] = -0.50
-        matrix[18, 3] = 0.15
+        # 3: 拇指根部摆位，帮助从另一侧包络把手
+        matrix[16, 3] = 0.70
+        matrix[17, 3] = -0.55
+        matrix[18, 3] = 0.25
+        matrix[19, 3] = 0.15
 
-        # 4: 四指 MCP 横向并拢，形成统一“夹爪面”
-        matrix[0, 4] = 0.12
-        matrix[4, 4] = 0.04
-        matrix[12, 4] = -0.04
-        matrix[8, 4] = -0.12
+        # 4: 四指 MCP 横向展开，形成更明确的 C-grasp 包络
+        matrix[0, 4] = 0.24
+        matrix[4, 4] = 0.10
+        matrix[12, 4] = -0.16
+        matrix[8, 4] = -0.30
         return matrix
 
     def zero_action(self) -> np.ndarray:
@@ -503,16 +605,19 @@ class SingleDoorResidualEnv:
 
     def _build_pinch_qpos_targets(self, anchor_qpos: Sequence[float]) -> Dict[str, np.ndarray]:
         anchor = self._clip_hand_qpos(anchor_qpos)
-        parallel_touch = self.synergy_to_qpos([0.45, 0.15, 0.42, 0.30, 0.10], base_qpos=self.open_qpos)
-        parallel_grasp = self.synergy_to_qpos([0.72, 0.42, 0.72, 0.52, 0.18], base_qpos=self.open_qpos)
-        parallel_actuate = self.synergy_to_qpos([0.88, 0.66, 0.92, 0.64, 0.22], base_qpos=self.open_qpos)
-        pinch_touch = self._clip_hand_qpos(0.20 * anchor + 0.50 * PINCH_TOUCH_QPOS + 0.30 * parallel_touch)
-        pinch_grasp = self._clip_hand_qpos(0.20 * anchor + 0.35 * PINCH_PRESET_QPOS + 0.45 * parallel_grasp)
-        pinch_actuate = self._clip_hand_qpos(0.15 * anchor + 0.30 * PINCH_ACTUATE_QPOS + 0.55 * parallel_actuate)
-        pinch_open = self._clip_hand_qpos(0.55 * pinch_grasp + 0.45 * pinch_actuate)
+        power_touch = self.synergy_to_qpos([0.62, 0.30, 0.64, 0.48, 0.40], base_qpos=self.open_qpos)
+        power_wrap = self.synergy_to_qpos([0.86, 0.56, 0.82, 0.62, 0.52], base_qpos=self.open_qpos)
+        power_grasp = self.synergy_to_qpos([1.00, 0.76, 0.96, 0.72, 0.58], base_qpos=self.open_qpos)
+        power_actuate = self.synergy_to_qpos([1.12, 0.92, 1.06, 0.82, 0.64], base_qpos=self.open_qpos)
+        pinch_touch = self._clip_hand_qpos(0.10 * anchor + 0.65 * PINCH_TOUCH_QPOS + 0.25 * power_touch)
+        pinch_wrap = self._clip_hand_qpos(0.10 * anchor + 0.28 * PINCH_TOUCH_QPOS + 0.34 * PINCH_PRESET_QPOS + 0.28 * power_wrap)
+        pinch_grasp = self._clip_hand_qpos(0.06 * anchor + 0.58 * PINCH_PRESET_QPOS + 0.36 * power_grasp)
+        pinch_actuate = self._clip_hand_qpos(0.04 * anchor + 0.56 * PINCH_ACTUATE_QPOS + 0.40 * power_actuate)
+        pinch_open = self._clip_hand_qpos(0.40 * pinch_grasp + 0.60 * pinch_actuate)
         return {
             "approach": self.open_qpos.copy(),
             "touch": pinch_touch.astype(np.float32),
+            "wrap": pinch_wrap.astype(np.float32),
             "grasp": pinch_grasp.astype(np.float32),
             "actuate": pinch_actuate.astype(np.float32),
             "open": pinch_open.astype(np.float32),
@@ -523,16 +628,20 @@ class SingleDoorResidualEnv:
         index2 = float(link_counts.get("index2", 0))
         middle2 = float(link_counts.get("middle2", 0))
         ring2 = float(link_counts.get("ring2", 0))
+        pinky2 = float(link_counts.get("pinky2", 0))
         index1x = float(link_counts.get("index1x", 0))
         middle1x = float(link_counts.get("middle1x", 0))
+        ring1x = float(link_counts.get("ring1x", 0))
+        pinky1x = float(link_counts.get("pinky1x", 0))
         thumb2 = float(link_counts.get("thumb2", 0))
         # Power grasp: palm and mid-phalanges wrapping the handle are most important
         return float(
             0.35 * contact_count
             + 8.0 * palm
             + 5.0 * (index2 + middle2)
-            + 3.0 * (ring2 + thumb2)
-            + 2.0 * (index1x + middle1x)
+            + 4.0 * (ring2 + pinky2)
+            + 3.5 * thumb2
+            + 2.0 * (index1x + middle1x + ring1x + pinky1x)
         )
 
     def _search_pinch_grasp(
@@ -548,10 +657,21 @@ class SingleDoorResidualEnv:
         trial_count = int(max(1, self.config.pinch_search_lateral_trials))
         offsets = np.linspace(-(trial_count // 2), trial_count // 2, trial_count, dtype=np.float32)
         lateral_offsets = offsets * lateral_step
-        depth_offsets = np.asarray([0.0, depth_step], dtype=np.float32)
+        depth_offsets = np.asarray([0.0, depth_step, 2.0 * depth_step, 3.0 * depth_step], dtype=np.float32)
+        pitch_deg = float(self.config.pinch_search_pitch_deg)
         yaw_deg = float(self.config.pinch_search_yaw_deg)
         roll_deg = float(self.config.pinch_search_roll_deg)
-        orientation_candidates = [(0.0, 0.0), (-yaw_deg, 0.0), (yaw_deg, 0.0), (0.0, -roll_deg), (0.0, roll_deg)]
+        orientation_candidates = [
+            (0.0, 0.0, 0.0),
+            (-pitch_deg, 0.0, 0.0),
+            (pitch_deg, 0.0, 0.0),
+            (0.0, -yaw_deg, 0.0),
+            (0.0, yaw_deg, 0.0),
+            (0.0, 0.0, -roll_deg),
+            (0.0, 0.0, roll_deg),
+            (-pitch_deg, -yaw_deg, 0.0),
+            (pitch_deg, yaw_deg, 0.0),
+        ]
 
         best_pose = base_pose.copy()
         best_info: Dict[str, Any] = {"stage": "pinch_search"}
@@ -568,8 +688,8 @@ class SingleDoorResidualEnv:
             axis=1,
         )
 
-        for yaw_offset_deg, roll_offset_deg in orientation_candidates:
-            local_delta = R.from_euler("xyz", [0.0, roll_offset_deg, yaw_offset_deg], degrees=True)
+        for pitch_offset_deg, yaw_offset_deg, roll_offset_deg in orientation_candidates:
+            local_delta = R.from_euler("xyz", [pitch_offset_deg, roll_offset_deg, yaw_offset_deg], degrees=True)
             world_delta = R.from_matrix(handle_frame) * local_delta * R.from_matrix(handle_frame).inv()
             rotated_quat = (world_delta * base_rot).as_quat().astype(np.float32)
             for lateral in lateral_offsets:
@@ -583,13 +703,13 @@ class SingleDoorResidualEnv:
                         target_qpos=target_qpos,
                         approach_dir=-world_geom["handle_out_world"],
                         obj_urdf_path=obj_urdf_path,
-                        surface_contact_thresh=0.020,
-                        min_contact_points=20,
-                        required_contact_links=["palm", "index2"],
+                        surface_contact_thresh=0.022,
+                        min_contact_points=12,
+                        required_contact_links=["palm"],
                         min_points_per_link=2,
-                        settle_steps=10,
-                        max_iters=10,
-                        push_step=depth_step,
+                        settle_steps=12,
+                        max_iters=14,
+                        push_step=depth_step * 1.5,
                     )
                     score = self._score_pinch_contact(info.get("link_counts", {}), int(info.get("contact_count", 0)))
                     min_dist = float(info.get("min_dist", 0.0))
@@ -604,6 +724,7 @@ class SingleDoorResidualEnv:
                         best_info = dict(info)
                         best_info["lateral_offset"] = float(lateral)
                         best_info["depth_offset"] = float(depth)
+                        best_info["pitch_offset_deg"] = float(pitch_offset_deg)
                         best_info["yaw_offset_deg"] = float(yaw_offset_deg)
                         best_info["roll_offset_deg"] = float(roll_offset_deg)
                         best_info["pinch_score"] = float(score)
@@ -651,9 +772,14 @@ class SingleDoorResidualEnv:
         refined = {k: np.asarray(v, dtype=np.float32).copy() for k, v in base_world_geom.items()}
 
         if self.npcs_handle_loc is not None:
-            npcs_center = self.npcs_handle_loc.handle_center.detach().cpu().numpy().astype(np.float32)
-            npcs_long = self.npcs_handle_loc.handle_long_axis.detach().cpu().numpy().astype(np.float32)
-            npcs_out = self.npcs_handle_loc.handle_normal.detach().cpu().numpy().astype(np.float32)
+            obj_world_pos = np.asarray(self.gym.arti_init_obj_pos_list[0], dtype=np.float32)
+            obj_world_rot = R.from_quat(np.asarray(self.gym.arti_init_obj_rot_list[0], dtype=np.float32))
+            npcs_center_local = self.npcs_handle_loc.handle_center.detach().cpu().numpy().astype(np.float32)
+            npcs_long_local = self.npcs_handle_loc.handle_long_axis.detach().cpu().numpy().astype(np.float32)
+            npcs_out_local = self.npcs_handle_loc.handle_normal.detach().cpu().numpy().astype(np.float32)
+            npcs_center = obj_world_pos + obj_world_rot.apply(npcs_center_local * float(self.obj_scale))
+            npcs_long = obj_world_rot.apply(npcs_long_local)
+            npcs_out = obj_world_rot.apply(npcs_out_local)
             if float(np.dot(npcs_long, refined["handle_long_world"])) < 0.0:
                 npcs_long = -npcs_long
             if float(np.dot(npcs_out, refined["handle_out_world"])) < 0.0:
@@ -684,6 +810,9 @@ class SingleDoorResidualEnv:
         refined["handle_front_center_world"] = (
             refined["handle_center_world"] + 0.5 * handle_depth * refined["handle_out_world"]
         ).astype(np.float32)
+        refined["handle_back_center_world"] = (
+            refined["handle_center_world"] - 0.5 * handle_depth * refined["handle_out_world"]
+        ).astype(np.float32)
         radial = refined["handle_center_world"] - refined["hinge_origin_world"]
         radial = radial - refined["hinge_axis_world"] * np.dot(radial, refined["hinge_axis_world"])
         radial = _normalize(radial, fallback=refined["handle_out_world"])
@@ -693,9 +822,104 @@ class SingleDoorResidualEnv:
         )
         return refined
 
+    def _store_handle_geom_correction(
+        self,
+        base_world_geom: Dict[str, np.ndarray],
+        refined_world_geom: Dict[str, np.ndarray],
+    ) -> None:
+        obj_world_pos = np.asarray(self.gym.arti_init_obj_pos_list[0], dtype=np.float32)
+        obj_world_rot = R.from_quat(np.asarray(self.gym.arti_init_obj_rot_list[0], dtype=np.float32))
+        base_frame_local = np.stack(
+            [
+                self.task_spec.handle_long_local,
+                self.task_spec.handle_short_local,
+                -self.task_spec.handle_out_local,
+            ],
+            axis=1,
+        ).astype(np.float32)
+        refined_center_local = (
+            obj_world_rot.inv().apply(refined_world_geom["handle_center_world"] - obj_world_pos) / float(self.obj_scale)
+        ).astype(np.float32)
+        refined_front_local = (
+            obj_world_rot.inv().apply(refined_world_geom["handle_front_center_world"] - obj_world_pos) / float(self.obj_scale)
+        ).astype(np.float32)
+        refined_long_local = obj_world_rot.inv().apply(refined_world_geom["handle_long_world"]).astype(np.float32)
+        refined_short_local = obj_world_rot.inv().apply(refined_world_geom["handle_short_world"]).astype(np.float32)
+        refined_out_local = obj_world_rot.inv().apply(refined_world_geom["handle_out_world"]).astype(np.float32)
+        refined_frame_local = np.stack(
+            [refined_long_local, refined_short_local, -refined_out_local],
+            axis=1,
+        ).astype(np.float32)
+        self.handle_geom_correction = {
+            "center_offset_handle": (base_frame_local.T @ (refined_center_local - self.task_spec.handle_center_local)).astype(np.float32),
+            "front_offset_handle": (base_frame_local.T @ (refined_front_local - self.task_spec.handle_front_center_local)).astype(np.float32),
+            "frame_correction": (base_frame_local.T @ refined_frame_local).astype(np.float32),
+        }
+
+    def _runtime_world_geom(self) -> Dict[str, np.ndarray]:
+        base_world_geom = self._current_world_geom()
+        if self.handle_geom_correction is None:
+            return base_world_geom
+
+        correction = self.handle_geom_correction
+        base_frame_world = np.stack(
+            [
+                base_world_geom["handle_long_world"],
+                base_world_geom["handle_short_world"],
+                -base_world_geom["handle_out_world"],
+            ],
+            axis=1,
+        ).astype(np.float32)
+        refined_frame_world = base_frame_world @ np.asarray(correction["frame_correction"], dtype=np.float32)
+        u_mat, _, vh_mat = np.linalg.svd(refined_frame_world, full_matrices=False)
+        refined_frame_world = (u_mat @ vh_mat).astype(np.float32)
+
+        refined_center_world = (
+            base_world_geom["handle_center_world"]
+            + base_frame_world @ np.asarray(correction["center_offset_handle"], dtype=np.float32)
+        ).astype(np.float32)
+        refined_front_center_world = (
+            base_world_geom["handle_front_center_world"]
+            + base_frame_world @ np.asarray(correction["front_offset_handle"], dtype=np.float32)
+        ).astype(np.float32)
+        handle_long_world = _normalize(refined_frame_world[:, 0], fallback=base_world_geom["handle_long_world"])
+        handle_short_world = _normalize(refined_frame_world[:, 1], fallback=base_world_geom["handle_short_world"])
+        handle_out_world = _normalize(-refined_frame_world[:, 2], fallback=base_world_geom["handle_out_world"])
+        handle_depth = float(self.task_spec.handle_extent_local[0]) * float(self.obj_scale)
+        refined_back_center_world = (
+            refined_front_center_world - handle_depth * handle_out_world
+        ).astype(np.float32)
+        handle_short_world = _normalize(
+            np.cross(-handle_out_world, handle_long_world),
+            fallback=handle_short_world,
+        )
+        handle_long_world = _normalize(
+            np.cross(handle_short_world, -handle_out_world),
+            fallback=handle_long_world,
+        )
+
+        radial = refined_center_world - base_world_geom["hinge_origin_world"]
+        radial = radial - base_world_geom["hinge_axis_world"] * np.dot(radial, base_world_geom["hinge_axis_world"])
+        radial = _normalize(radial, fallback=handle_out_world)
+        open_tangent_world = _normalize(
+            self.task_spec.open_sign * np.cross(base_world_geom["hinge_axis_world"], radial),
+            fallback=handle_long_world,
+        )
+        return {
+            "hinge_origin_world": base_world_geom["hinge_origin_world"].astype(np.float32),
+            "hinge_axis_world": base_world_geom["hinge_axis_world"].astype(np.float32),
+            "handle_center_world": refined_center_world.astype(np.float32),
+            "handle_front_center_world": refined_front_center_world.astype(np.float32),
+            "handle_back_center_world": refined_back_center_world.astype(np.float32),
+            "handle_out_world": handle_out_world.astype(np.float32),
+            "handle_long_world": handle_long_world.astype(np.float32),
+            "handle_short_world": handle_short_world.astype(np.float32),
+            "open_tangent_world": open_tangent_world.astype(np.float32),
+        }
+
     def get_handle_geometry_diagnostics(self) -> Dict[str, Any]:
         local_extent = np.asarray(self.task_spec.handle_extent_local, dtype=np.float32) * float(self.obj_scale)
-        world_geom = self._current_world_geom()
+        world_geom = self._runtime_world_geom()
         diag = {
             "handle_extent_world": _to_jsonable(local_extent),
             "handle_depth_world": float(local_extent[0]),
@@ -789,10 +1013,14 @@ class SingleDoorResidualEnv:
             print(f"[HandlePC] Bbox fallback: {handle_point_cloud.shape[0]} pts")
 
         world_geom = self._refine_teacher_world_geom(base_world_geom, handle_point_cloud)
+        self.teacher_world_geom = {k: np.asarray(v, dtype=np.float32).copy() for k, v in world_geom.items()}
+        self._store_handle_geom_correction(base_world_geom, world_geom)
         init_rotation = self._estimate_initial_rotation(world_geom)
         handle_depth = float(self.task_spec.handle_extent_local[0]) * float(self.obj_scale)
-        pregrasp_offset = max(float(self.config.pregrasp_offset), 0.5 * handle_depth + 0.004)
-        pregrasp_position = world_geom["handle_center_world"] + pregrasp_offset * world_geom["handle_out_world"]
+        pregrasp_clearance = max(float(self.config.pregrasp_offset), min(0.010, 0.10 * handle_depth))
+        desired_palm_patch_world = world_geom["handle_front_center_world"] + pregrasp_clearance * world_geom["handle_out_world"]
+        palm_patch_world_offset = R.from_quat(init_rotation).apply(self.palm_patch_local)
+        pregrasp_position = desired_palm_patch_world - palm_patch_world_offset
         self.pregrasp_pose = np.concatenate([pregrasp_position, init_rotation], axis=0).astype(np.float32)
 
         if self.config.use_optimized_grasp:
@@ -805,7 +1033,11 @@ class SingleDoorResidualEnv:
                 handle_out=world_geom["handle_out_world"],
                 handle_long=world_geom["handle_long_world"],
             )
-            anchor_qpos = self.closed_qpos.copy()  # Discard pinch opt_qpos; keep power grasp preset
+            opt_qpos = self._clip_hand_qpos(opt_qpos)
+            if self.config.use_optimized_qpos:
+                anchor_qpos = self._clip_hand_qpos(0.25 * self.closed_qpos + 0.75 * opt_qpos)
+            else:
+                anchor_qpos = self.closed_qpos.copy()
             anchor_pose = np.concatenate([opt_pos, opt_rot], axis=0).astype(np.float32)
         else:
             anchor_qpos = self.closed_qpos.copy()
@@ -837,6 +1069,11 @@ class SingleDoorResidualEnv:
 
         self.anchor_pose = np.asarray(anchor_pose, dtype=np.float32)
         self.anchor_qpos = np.asarray(anchor_qpos, dtype=np.float32)
+        self.touch_pose = _interpolate_pose(self.pregrasp_pose, self.anchor_pose, 0.72)
+        self.wrap_pose = _interpolate_pose(self.pregrasp_pose, self.anchor_pose, 0.92)
+        handle_depth = float(self.task_spec.handle_extent_local[0]) * float(self.obj_scale)
+        wrap_inset = min(0.70 * handle_depth, 0.016)
+        self.wrap_pose[:3] -= wrap_inset * world_geom["handle_out_world"]
         self.phase_qpos_targets = self._build_pinch_qpos_targets(self.anchor_qpos)
         self.demo_traj = generate_kinematic_trajectory(
             start_pose_6d=self.anchor_pose,
@@ -851,6 +1088,8 @@ class SingleDoorResidualEnv:
             "grasp_info": _to_jsonable(grasp_info),
             "spawn_height": float(self.gym.arti_init_obj_pos_list[0][2]),
             "pregrasp_pose": _to_jsonable(self.pregrasp_pose),
+            "touch_pose": _to_jsonable(self.touch_pose),
+            "wrap_pose": _to_jsonable(self.wrap_pose),
             "anchor_pose": _to_jsonable(self.anchor_pose),
             "anchor_qpos": _to_jsonable(self.anchor_qpos),
             "demo_traj_len": int(len(self.demo_traj)),
@@ -877,10 +1116,20 @@ class SingleDoorResidualEnv:
         self.bps_basis_points = generate_bps_basis(
             num_points=self.config.bps_num_points,
             radius=self.config.bps_radius,
+            handle_extent_local=np.asarray(self.task_spec.handle_extent_local, dtype=np.float32) * float(self.obj_scale),
         )
-        self.bps_palm_target_mask = (self.bps_basis_points[:, 2] <= 0.0)
-        if not np.any(self.bps_palm_target_mask):
-            self.bps_palm_target_mask = np.ones((self.bps_basis_points.shape[0],), dtype=np.bool_)
+        self.bps_phase_target_masks = build_bps_phase_target_masks(
+            self.bps_basis_points,
+            np.asarray(self.task_spec.handle_extent_local, dtype=np.float32) * float(self.obj_scale),
+        )
+        self.bps_palm_target_mask = np.asarray(
+            self.bps_phase_target_masks.get("touch", np.ones((self.bps_basis_points.shape[0],), dtype=np.bool_)),
+            dtype=np.bool_,
+        )
+        self.bps_wrap_target_mask = np.asarray(
+            self.bps_phase_target_masks.get("wrap", self.bps_palm_target_mask),
+            dtype=np.bool_,
+        )
 
         # Precompute BPS (handle is static relative to object root at init)
         self.cached_bps_features = compute_bps_features(
@@ -905,13 +1154,13 @@ class SingleDoorResidualEnv:
                 target_qpos=hand_qpos,
                 approach_dir=-world_geom["handle_out_world"],
                 obj_urdf_path=self.sim_obj_urdf_path,
-                surface_contact_thresh=0.015,
-                min_contact_points=40,
-                required_contact_links=["palm", "index2", "middle2"],
+                surface_contact_thresh=0.022,
+                min_contact_points=14,
+                required_contact_links=["palm"],
                 min_points_per_link=2,
-                settle_steps=8,
-                max_iters=12,
-                push_step=0.002,
+                settle_steps=10,
+                max_iters=16,
+                push_step=0.003,
             )
         return np.asarray(stabilized_pose, dtype=np.float32), bool(stable), grasp_info
 
@@ -995,27 +1244,157 @@ class SingleDoorResidualEnv:
 
     def _base_pose_for_step(self) -> np.ndarray:
         if self.config.use_demo_base_pose:
-            index = int(np.clip(self.step_count, 0, len(self.demo_traj) - 1))
-            return self.demo_traj[index].copy()
+            pose, _ = self.get_demo_base(step_index=self.step_count)
+            return pose.copy()
         return self.last_pose_target.copy()
 
     def _base_qpos_for_step(self) -> np.ndarray:
         if self.config.use_demo_base_pose:
-            return self.phase_qpos_targets.get(self.get_curriculum_phase(), self.anchor_qpos).copy()
+            _, qpos = self.get_demo_base(step_index=self.step_count)
+            return qpos.copy()
         return self.last_qpos_target.copy()
 
+    def _phase_rank(self, phase_name: str) -> int:
+        order = {
+            "approach": 0,
+            "touch": 1,
+            "wrap": 2,
+            "grasp": 3,
+            "actuate": 4,
+            "open": 5,
+            "success": 6,
+        }
+        return int(order.get(str(phase_name), 0))
+
+    def _minimum_teacher_phase(self) -> str:
+        if self.config.curriculum_enabled and len(self.config.curriculum_levels) > 0:
+            return str(self.config.curriculum_levels[int(np.clip(self.curriculum_level, 0, len(self.config.curriculum_levels) - 1))])
+        return str(self.config.reset_phase)
+
+    def _phase_local_step(self, step_index: Optional[int] = None) -> int:
+        current_step = self.step_count if step_index is None else int(step_index)
+        return int(max(0, current_step - int(self.phase_entry_step)))
+
+    def _teacher_pose_for_phase(self, phase_name: str, local_step: int) -> np.ndarray:
+        phase = str(phase_name)
+        if self.config.skip_to_pull:
+            # Short approach to anchor, then immediately follow pull trajectory
+            if phase == "approach":
+                denom = max(int(self.config.approach_steps), 1)
+                return _interpolate_pose(self.pregrasp_pose, self.anchor_pose, local_step / float(denom))
+            # All other phases: follow the pull demo trajectory
+            index = int(np.clip(local_step, 0, len(self.demo_traj) - 1))
+            return self.demo_traj[index].copy()
+        if phase == "approach":
+            denom = max(int(self.config.approach_steps), 1)
+            return _interpolate_pose(self.pregrasp_pose, self.touch_pose, local_step / float(denom))
+        if phase == "touch":
+            denom = max(int(self.config.touch_steps), 1)
+            return _interpolate_pose(self.touch_pose, self.wrap_pose, local_step / float(denom))
+        if phase == "wrap":
+            denom = max(int(self.config.wrap_steps), 1)
+            return _interpolate_pose(self.wrap_pose, self.anchor_pose, local_step / float(denom))
+        if phase == "grasp":
+            return self.anchor_pose.copy()
+        if phase in {"actuate", "open", "success"}:
+            index = int(np.clip(local_step, 0, len(self.demo_traj) - 1))
+            return self.demo_traj[index].copy()
+        return self.anchor_pose.copy()
+
+    def _set_active_phase(self, phase_name: str, step_index: Optional[int] = None) -> None:
+        next_phase = str(phase_name)
+        floor_phase = self._minimum_teacher_phase()
+        if self._phase_rank(next_phase) < self._phase_rank(floor_phase):
+            next_phase = floor_phase
+        if next_phase != str(self.active_phase):
+            self.active_phase = next_phase
+            self.phase_entry_step = self.step_count if step_index is None else int(step_index)
+
+    def _update_active_phase(self, state, prev_state) -> str:
+        if self.config.skip_to_pull:
+            # After a brief approach, jump straight to actuate
+            if self.step_count >= int(self.config.approach_steps):
+                self._set_active_phase("actuate", step_index=self.step_count)
+            else:
+                self._set_active_phase("approach", step_index=0)
+            if state.progress >= float(self.reward_config.success_progress):
+                self._set_active_phase("success", step_index=self.step_count)
+            return str(self.active_phase)
+
+        progress_delta = 0.0 if prev_state is None else float(state.progress - prev_state.progress)
+        link_counts = dict(state.surface_contact_link_counts)
+        contact_score = compute_contact_score(link_counts, target_points=self.config.contact_target_points)
+        opposition_score = compute_opposition_score(link_counts, target_points=self.config.contact_target_points)
+        force_closure_score = compute_force_closure_score(link_counts, target_points=self.config.contact_target_points)
+        inferred_phase = infer_single_door_phase(
+            progress=float(state.progress),
+            progress_delta=float(progress_delta),
+            contact_score=float(contact_score),
+            opposition_score=float(opposition_score),
+            force_closure_score=float(force_closure_score),
+            stable_contact=bool(state.surface_contact_stable),
+            success_progress=float(self.reward_config.success_progress),
+            palm_bps_contact_ratio=float(state.palm_bps_contact_ratio),
+            wrap_bps_contact_ratio=float(state.wrap_bps_contact_ratio),
+            palm_handle_min_dist=float(state.palm_handle_min_dist),
+            handle_contact_ratio=float(state.handle_contact_ratio),
+        )
+        if inferred_phase == "approach" and state.palm_handle_min_dist <= 0.07:
+            inferred_phase = "touch"
+        if inferred_phase == "touch" and (
+            state.palm_handle_min_dist <= 0.040
+            and state.palm_bps_contact_ratio >= 0.15
+        ):
+            inferred_phase = "wrap"
+        if inferred_phase == "wrap" and self._power_grasp_established(state):
+            inferred_phase = "grasp"
+        if inferred_phase == "grasp" and progress_delta > 2e-4:
+            inferred_phase = "actuate"
+
+        # --- State-gated phase transitions with regression ---
+        # Allow regression from grasp/wrap back to earlier phases when
+        # contact quality drops, so the agent must re-establish contact
+        # rather than proceeding with a marginal grasp.
+        floor_rank = self._phase_rank(self._minimum_teacher_phase())
+        inferred_rank = self._phase_rank(inferred_phase)
+        current_rank = self._phase_rank(self.active_phase)
+
+        # Phases actuate/open/success (rank >= 4) are locked once entered
+        # — regressing during a pull would destabilise the trajectory.
+        # For earlier phases (approach..grasp, rank 0-3), allow regression
+        # when the inferred phase drops below the current active phase.
+        if current_rank <= 3:
+            next_rank = max(floor_rank, inferred_rank)
+        else:
+            next_rank = max(floor_rank, current_rank, inferred_rank)
+
+        phase_by_rank = {
+            0: "approach",
+            1: "touch",
+            2: "wrap",
+            3: "grasp",
+            4: "actuate",
+            5: "open",
+            6: "success",
+        }
+        next_phase = phase_by_rank.get(int(next_rank), "grasp")
+        self._set_active_phase(next_phase, step_index=self.step_count)
+        return str(self.active_phase)
+
     def get_demo_base(self, step_index: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
-        if step_index is None:
-            step_index = self.step_count
-        pose = self.demo_traj[int(np.clip(step_index, 0, len(self.demo_traj) - 1))].copy()
-        qpos = self.phase_qpos_targets.get(self.get_curriculum_phase(), self.anchor_qpos).copy()
+        phase_name = self.get_curriculum_phase()
+        local_step = self._phase_local_step(step_index=step_index)
+        pose = self._teacher_pose_for_phase(phase_name, local_step)
+        qpos_key = phase_name if phase_name in self.phase_qpos_targets else "open"
+        qpos = self.phase_qpos_targets.get(qpos_key, self.anchor_qpos).copy()
         return pose.astype(np.float32), qpos.astype(np.float32)
 
     def get_curriculum_phase(self) -> str:
-        levels = list(self.config.curriculum_levels)
-        if len(levels) == 0:
-            return "grasp"
-        return levels[int(np.clip(self.curriculum_level, 0, len(levels) - 1))]
+        floor_phase = self._minimum_teacher_phase()
+        if self._phase_rank(self.active_phase) < self._phase_rank(floor_phase):
+            self.active_phase = floor_phase
+            self.phase_entry_step = self.step_count
+        return str(self.active_phase)
 
     def update_curriculum(self, episode_success: bool) -> Dict[str, Any]:
         if not self.config.curriculum_enabled:
@@ -1044,17 +1423,19 @@ class SingleDoorResidualEnv:
         }
 
     def _phase_demo_index(self, phase_name: str) -> int:
-        if phase_name == "grasp":
-            return 0
         if phase_name == "actuate":
             return int(max(0, 0.15 * (len(self.demo_traj) - 1)))
         if phase_name == "open":
-            return 0
+            return int(len(self.demo_traj) - 1)
         return 0
 
     def _curriculum_reset_pose(self, phase_name: str) -> Tuple[np.ndarray, np.ndarray]:
         if phase_name == "approach":
             return self.pregrasp_pose.copy(), self.open_qpos.copy()
+        if phase_name == "touch":
+            return self.touch_pose.copy(), self.phase_qpos_targets["touch"].copy()
+        if phase_name == "wrap":
+            return self.wrap_pose.copy(), self.phase_qpos_targets["wrap"].copy()
         if phase_name == "grasp":
             return self.anchor_pose.copy(), self.phase_qpos_targets["grasp"].copy()
         if phase_name == "actuate":
@@ -1073,28 +1454,86 @@ class SingleDoorResidualEnv:
         target_qpos = self._apply_synergy_action(base_qpos, action_arr[6:])
         return target_pose.astype(np.float32), target_qpos.astype(np.float32)
 
+    def _teacher_grasp_quality_ok(self) -> bool:
+        """Check whether the current grasp quality is sufficient to advance
+        past wrap/grasp into the pull phase.  Uses prev_state which holds
+        the runtime state from the previous simulation step."""
+        st = self.prev_state
+        if st is None:
+            return False
+        link_counts = dict(st.surface_contact_link_counts)
+        fc = compute_force_closure_score(
+            link_counts, target_points=self.config.contact_target_points
+        )
+        opp = compute_opposition_score(
+            link_counts, target_points=self.config.contact_target_points
+        )
+        wrap_bps = float(st.wrap_bps_contact_ratio)
+        bps_ok = bool(
+            st.palm_handle_min_dist < 0.099
+            or st.palm_bps_contact_ratio > 0.0
+            or wrap_bps > 0.0
+        )
+        if bps_ok:
+            # Require meaningful force closure AND wrap coverage
+            return bool(
+                fc >= 0.30 and wrap_bps >= 0.25
+            ) or bool(
+                opp >= 0.35 and wrap_bps >= 0.20
+            )
+        else:
+            # BPS unavailable — fall back to force closure / opposition alone
+            return bool(fc >= 0.30) or bool(opp >= 0.35)
+
     def get_teacher_action(self, step_index: Optional[int] = None) -> np.ndarray:
         if step_index is None:
             step_index = self.step_count
         if not self.config.use_demo_base_pose:
             return np.zeros(self.action_dim, dtype=np.float32)
         base_pose, base_qpos = self.get_demo_base(step_index=step_index)
-        next_index = int(np.clip(step_index + 1, 0, len(self.demo_traj) - 1))
-        next_pose = self.demo_traj[next_index].copy()
         teacher_phase = self.get_curriculum_phase()
+        local_step = self._phase_local_step(step_index=step_index)
+
+        # --- Grasp-quality hold ---
+        # During wrap/grasp, if the hand hasn't achieved sufficient force
+        # closure + BPS wrap coverage, the teacher holds position and
+        # repeats the curl action instead of advancing toward the pull.
+        # Skipped in skip_to_pull mode — no wrap/grasp phases.
+        grasp_hold = False
+        if not self.config.skip_to_pull and teacher_phase in {"wrap", "grasp"} and not self._teacher_grasp_quality_ok():
+            grasp_hold = True
+
+        next_pose = self._teacher_pose_for_phase(teacher_phase, local_step + 1)
+        if teacher_phase == "wrap":
+            runtime_geom = self._runtime_world_geom()
+            next_pose = next_pose.copy()
+            next_pose[:3] -= 0.18 * float(self.config.pos_action_scale) * runtime_geom["handle_out_world"]
         if teacher_phase == "grasp":
             pull_pose = next_pose.copy()
-            pull_pose[:3] += 0.35 * float(self.config.pos_action_scale) * self.prev_state.open_tangent_world
-            pull_pose[:3] -= 0.20 * float(self.config.pos_action_scale) * self.prev_state.handle_out_world
+            runtime_geom = self._runtime_world_geom()
+            if grasp_hold:
+                # Hold position: do not advance along pull tangent,
+                # keep pressing inward to deepen the wrap.
+                pull_pose[:3] -= 0.25 * float(self.config.pos_action_scale) * runtime_geom["handle_out_world"]
+            else:
+                if local_step >= int(self.config.grasp_hold_steps):
+                    pull_pose[:3] += 0.35 * float(self.config.pos_action_scale) * runtime_geom["open_tangent_world"]
+                pull_pose[:3] -= 0.20 * float(self.config.pos_action_scale) * runtime_geom["handle_out_world"]
             next_pose = pull_pose
         pos_residual = (next_pose[:3] - base_pose[:3]) / max(self.config.pos_action_scale, 1e-6)
         delta_rot = R.from_quat(next_pose[3:7]) * R.from_quat(base_pose[3:7]).inv()
         rotvec_residual = delta_rot.as_rotvec() / max(self.config.rot_action_scale, 1e-6)
         desired_qpos = self.phase_qpos_targets.get(teacher_phase, self.anchor_qpos).copy()
         if teacher_phase == "grasp":
-            desired_qpos = self.phase_qpos_targets.get("actuate", desired_qpos).copy()
-        elif teacher_phase == "touch":
+            if grasp_hold:
+                # Keep targeting the deep-curl grasp pose, not the actuate pose
+                desired_qpos = self.phase_qpos_targets.get("grasp", desired_qpos).copy()
+            else:
+                desired_qpos = self.phase_qpos_targets.get("actuate", desired_qpos).copy()
+        elif teacher_phase == "wrap":
             desired_qpos = self.phase_qpos_targets.get("grasp", desired_qpos).copy()
+        elif teacher_phase == "touch":
+            desired_qpos = self.phase_qpos_targets.get("wrap", desired_qpos).copy()
         qpos_delta = desired_qpos - base_qpos
         synergy_residual = np.linalg.pinv(self.synergy_matrix) @ qpos_delta
         synergy_residual = synergy_residual / max(self.config.synergy_action_scale, 1e-6)
@@ -1123,7 +1562,7 @@ class SingleDoorResidualEnv:
             "teacher_qpos_residual": teacher_qpos_residual.astype(np.float32),
             "teacher_contact_target": get_phase_contact_target(teacher_phase).astype(np.float32),
             "teacher_phase": teacher_phase,
-            "teacher_pull_hint": bool(teacher_phase == "grasp"),
+            "teacher_pull_hint": bool(teacher_phase in {"grasp", "actuate"}),
         }
 
     def get_teacher_root_pos(self, step_index: Optional[int] = None) -> np.ndarray:
@@ -1182,19 +1621,28 @@ class SingleDoorResidualEnv:
     def _apply_door_plane_buffer(self, hand_pose: Sequence[float], runtime_state) -> np.ndarray:
         pose = np.asarray(hand_pose, dtype=np.float32).copy()
         plane_normal = runtime_state.handle_out_world
-        plane_point = runtime_state.handle_front_center_world - float(self.config.palm_safe_buffer) * plane_normal
-        signed_dist = float(np.dot(pose[:3] - plane_point, plane_normal))
+        plane_point = runtime_state.handle_back_center_world - float(self.config.palm_safe_buffer) * plane_normal
+        palm_patch_world = pose[:3] + R.from_quat(pose[3:7]).apply(self.palm_patch_local)
+        signed_dist = float(np.dot(palm_patch_world - plane_point, plane_normal))
         if signed_dist < 0.0:
             pose[:3] = pose[:3] - signed_dist * plane_normal
         return pose.astype(np.float32)
 
     def _door_plane_violation(self, runtime_state) -> float:
         plane_normal = runtime_state.handle_out_world
-        plane_point = runtime_state.handle_front_center_world - float(self.config.palm_safe_buffer) * plane_normal
+        plane_point = runtime_state.handle_back_center_world - float(self.config.palm_safe_buffer) * plane_normal
         signed_dist = float(np.dot(runtime_state.palm_center_world - plane_point, plane_normal))
         return float(max(0.0, -signed_dist))
 
+    def _bps_target_mask_for_phase(self, phase_name: str) -> Optional[np.ndarray]:
+        if self.bps_basis_points is None or self.bps_basis_points.size == 0:
+            return None
+        masks = self.bps_phase_target_masks or {}
+        default_mask = np.ones((self.bps_basis_points.shape[0],), dtype=np.bool_)
+        return np.asarray(masks.get(str(phase_name), default_mask), dtype=np.bool_)
+
     def _extract_runtime_state(self):
+        phase_name = self.get_curriculum_phase()
         return extract_single_door_runtime_state(
             self.gym,
             self.task_spec,
@@ -1204,8 +1652,10 @@ class SingleDoorResidualEnv:
             contact_target_points=self.config.contact_target_points,
             handle_bps_features=self.cached_bps_features,
             bps_basis_points=self.bps_basis_points,
-            bps_target_mask=self.bps_palm_target_mask,
+            bps_target_mask=self._bps_target_mask_for_phase(phase_name),
+            wrap_bps_target_mask=self._bps_target_mask_for_phase("wrap"),
             contact_obj_urdf_path=self.sim_obj_urdf_path,
+            world_geom_override=self._runtime_world_geom(),
         )
 
     def _power_grasp_established(self, runtime_state) -> bool:
@@ -1224,12 +1674,13 @@ class SingleDoorResidualEnv:
             or runtime_state.handle_contact_ratio >= float(self.config.fake_force_contact_threshold)
             or (
                 runtime_state.palm_handle_min_dist <= 0.020
-                and runtime_state.palm_bps_contact_ratio >= 0.20
+                and runtime_state.wrap_bps_contact_ratio >= 0.20
                 and mid_ratio >= 0.20
             )
             or (
                 palm_ratio >= float(self.config.fake_force_palm_threshold)
                 and mid_ratio >= float(self.config.fake_force_mid_contact_threshold)
+                and runtime_state.wrap_bps_contact_ratio >= 0.15
             )
         )
 
@@ -1292,10 +1743,16 @@ class SingleDoorResidualEnv:
 
     def reset(self, phase: Optional[str] = None, pose_noise: Optional[float] = None, rot_noise: Optional[float] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
         reset_phase = self.config.reset_phase if phase is None else phase
-        if phase is None and self.config.curriculum_enabled:
-            reset_phase = self.get_curriculum_phase()
+        if self.config.skip_to_pull and phase is None:
+            # Start at approach — the phase system will advance to actuate
+            # after approach_steps frames
+            reset_phase = "approach"
+        elif phase is None and self.config.curriculum_enabled:
+            reset_phase = self._minimum_teacher_phase()
         pose_noise_value = self.config.reset_pose_noise if pose_noise is None else float(pose_noise)
         rot_noise_value = self.config.reset_rot_noise if rot_noise is None else float(rot_noise)
+        self.active_phase = str(reset_phase)
+        self.phase_entry_step = 0
         hand_pose, hand_qpos = self._curriculum_reset_pose(reset_phase)
 
         if pose_noise_value > 0.0:
@@ -1314,7 +1771,9 @@ class SingleDoorResidualEnv:
         self.last_qpos_target = hand_qpos.copy()
         self.prev_action = self.zero_action()
         self.step_count = 0
-        self.grasp_settle_counter = int(max(0, self.config.grasp_settle_steps if reset_phase != "approach" else 0))
+        self.phase_entry_step = 0
+        settle_on_reset = reset_phase in {"wrap", "grasp", "actuate", "open"}
+        self.grasp_settle_counter = int(max(0, self.config.grasp_settle_steps if settle_on_reset else 0))
         self.prev_state = self._extract_runtime_state()
         # Tracking error at reset (zero by definition when reset matches teacher)
         reset_teacher_pos = self.get_teacher_root_pos(step_index=0)
@@ -1354,7 +1813,10 @@ class SingleDoorResidualEnv:
             "palm_handle_min_dist": float(self.prev_state.palm_handle_min_dist),
             "palm_bps_min_dist": float(self.prev_state.palm_bps_min_dist),
             "palm_bps_contact_ratio": float(self.prev_state.palm_bps_contact_ratio),
+            "wrap_bps_min_dist": float(self.prev_state.wrap_bps_min_dist),
+            "wrap_bps_contact_ratio": float(self.prev_state.wrap_bps_contact_ratio),
             "door_plane_violation": float(self._door_plane_violation(self.prev_state)),
+            "bps_target_phase": str(self.get_curriculum_phase()),
             "contact_features": _to_jsonable(build_contact_feature_vector(self.prev_state.surface_contact_link_counts)),
             "contact_target": _to_jsonable(get_phase_contact_target(self.get_curriculum_phase())),
             "contact_link_order": list(CONTACT_LINK_ORDER),
@@ -1375,10 +1837,12 @@ class SingleDoorResidualEnv:
 
     def step(self, action: Sequence[float]) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
         action_arr = np.asarray(action, dtype=np.float32).reshape(self.action_dim)
+        prev_state = self.prev_state
         teacher_targets = self.get_teacher_targets(step_index=self.step_count)
         teacher_root_pos = self.get_teacher_root_pos(step_index=self.step_count)
         teacher_root_rot = self.get_teacher_root_rot(step_index=self.step_count)
         teacher_qpos = self.get_teacher_qpos(step_index=self.step_count)
+        teacher_phase = self.get_curriculum_phase()
         teacher_pose = np.concatenate([teacher_root_pos, teacher_root_rot], axis=0).astype(np.float32)
         in_grasp_settle = bool(self.grasp_settle_counter > 0)
         if in_grasp_settle:
@@ -1388,8 +1852,8 @@ class SingleDoorResidualEnv:
             target_pose = self._apply_pose_action(teacher_pose, action_arr[:6])
             target_qpos = self._apply_synergy_action(teacher_qpos, action_arr[6:])
 
-        if self.prev_state is not None:
-            target_pose = self._apply_door_plane_buffer(target_pose, self.prev_state)
+        if prev_state is not None:
+            target_pose = self._apply_door_plane_buffer(target_pose, prev_state)
 
         self._apply_hand_targets(hand_pose=target_pose, hand_qpos=target_qpos, settle_steps=max(1, self.config.action_repeat))
         state = self._extract_runtime_state()
@@ -1401,7 +1865,7 @@ class SingleDoorResidualEnv:
             state = self._extract_runtime_state()
             target_pose = safe_pose
 
-        state, fake_force_info = self._apply_fake_force_coupling(self.prev_state, state)
+        state, fake_force_info = self._apply_fake_force_coupling(prev_state, state)
 
         # --- Tracking error computation ---
         # Use step_count (before increment) so the teacher target matches the
@@ -1416,12 +1880,14 @@ class SingleDoorResidualEnv:
             "tracking_rot_error": tracking_rot_error_rotvec,
             "tracking_qpos_error": tracking_qpos_error,
             "residual_action": action_arr,
+            "teacher_phase": teacher_phase,
+            "skip_to_pull": bool(self.config.skip_to_pull),
         }
 
         # Compute reward with tracking terms (prev_state is still the old state)
         reward_terms = compute_single_door_reward(
             state=state,
-            prev_state=self.prev_state,
+            prev_state=prev_state,
             action=action_arr,
             prev_action=self.prev_action,
             config=self.reward_config,
@@ -1433,6 +1899,7 @@ class SingleDoorResidualEnv:
         self.last_pose_target = target_pose.copy()
         self.last_qpos_target = target_qpos.copy()
         self.step_count += 1
+        active_phase = self._update_active_phase(state, prev_state)
 
         done = bool(state.progress >= self.reward_config.success_progress or self.step_count >= self.config.max_episode_steps)
         obs = build_single_door_observation(
@@ -1445,7 +1912,7 @@ class SingleDoorResidualEnv:
         )
         info = {
             "step_count": int(self.step_count),
-            "curriculum_phase": self.get_curriculum_phase(),
+            "curriculum_phase": active_phase,
             "teacher_action": _to_jsonable(teacher_targets["teacher_action"]),
             "teacher_pose": _to_jsonable(teacher_pose),
             "teacher_qpos": _to_jsonable(teacher_qpos),
@@ -1477,7 +1944,10 @@ class SingleDoorResidualEnv:
             "palm_handle_min_dist": float(state.palm_handle_min_dist),
             "palm_bps_min_dist": float(state.palm_bps_min_dist),
             "palm_bps_contact_ratio": float(state.palm_bps_contact_ratio),
+            "wrap_bps_min_dist": float(state.wrap_bps_min_dist),
+            "wrap_bps_contact_ratio": float(state.wrap_bps_contact_ratio),
             "door_plane_violation": float(self._door_plane_violation(state)),
+            "bps_target_phase": str(teacher_phase),
             "surface_contact_link_counts": dict(state.surface_contact_link_counts),
             "pinch_debug": {
                 "thumb3": int(state.surface_contact_link_counts.get("thumb3", 0)),

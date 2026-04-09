@@ -1,3 +1,7 @@
+import os
+import struct
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,6 +16,51 @@ def quat_to_matrix_xyzw(quat):
         2*x*z - 2*y*w,     2*y*z + 2*x*w,     1 - 2*x**2 - 2*y**2
     ]).reshape(3, 3)
 
+
+def _load_binary_stl_vertices(stl_path):
+    if not os.path.exists(stl_path):
+        return np.zeros((0, 3), dtype=np.float32)
+    with open(stl_path, "rb") as handle:
+        handle.read(80)
+        tri_count_bytes = handle.read(4)
+        if len(tri_count_bytes) != 4:
+            return np.zeros((0, 3), dtype=np.float32)
+        tri_count = struct.unpack("<I", tri_count_bytes)[0]
+        data = handle.read()
+
+    verts = []
+    for tri_idx in range(int(tri_count)):
+        offset = tri_idx * 50
+        if offset + 50 > len(data):
+            break
+        vals = struct.unpack("<12fH", data[offset : offset + 50])
+        verts.extend(
+            [
+                (vals[3], vals[4], vals[5]),
+                (vals[6], vals[7], vals[8]),
+                (vals[9], vals[10], vals[11]),
+            ]
+        )
+    if len(verts) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    return np.asarray(verts, dtype=np.float32)
+
+
+def _estimate_palm_reference_local(mano_urdf_path):
+    palm_mesh_path = os.path.join(os.path.dirname(mano_urdf_path), "meshes", "palm.stl")
+    palm_vertices = _load_binary_stl_vertices(palm_mesh_path)
+    if palm_vertices.shape[0] == 0:
+        fallback = np.array([-0.04, 0.0, 0.0], dtype=np.float32)
+        return fallback.copy(), fallback.copy()
+
+    palm_center_local = palm_vertices.mean(axis=0).astype(np.float32)
+    x_thresh = float(np.quantile(palm_vertices[:, 0], 0.30))
+    palm_patch = palm_vertices[palm_vertices[:, 0] <= x_thresh]
+    if palm_patch.shape[0] < 32:
+        palm_patch = palm_vertices
+    palm_patch_local = palm_patch.mean(axis=0).astype(np.float32)
+    return palm_center_local, palm_patch_local
+
 class ManoChamferSDFOptimizer(nn.Module):
     def __init__(self, mano_urdf_path, init_palm_pos, init_palm_rot, device="cuda"):
         super().__init__()
@@ -22,9 +71,12 @@ class ManoChamferSDFOptimizer(nn.Module):
         self.palm_pos = nn.Parameter(torch.tensor(init_palm_pos, dtype=torch.float32, device=device))
         self.palm_rot = nn.Parameter(torch.tensor(init_palm_rot, dtype=torch.float32, device=device))
         self.qpos = nn.Parameter(torch.ones(20, dtype=torch.float32, device=device) * 0.1)
-        
+
         # 保存初始旋转作为基准，防止优化时手腕乱扭
         self.init_palm_rot = torch.tensor(init_palm_rot, dtype=torch.float32, device=device)
+        palm_center_local, palm_patch_local = _estimate_palm_reference_local(mano_urdf_path)
+        self.palm_center_local = torch.tensor(palm_center_local, dtype=torch.float32, device=device)
+        self.palm_patch_local = torch.tensor(palm_patch_local, dtype=torch.float32, device=device)
         
         self.joint_names = [
             'j_index1y', 'j_index1x', 'j_index2', 'j_index3',
@@ -53,7 +105,9 @@ class ManoChamferSDFOptimizer(nn.Module):
         joint_dict = {name: self.qpos[i].unsqueeze(0) for i, name in enumerate(self.joint_names)}
         ret = self.chain.forward_kinematics(joint_dict)
         rot_mat = quat_to_matrix_xyzw(self.palm_rot)
-        
+        palm_center_world = rot_mat @ self.palm_center_local + self.palm_pos
+        palm_patch_world = rot_mat @ self.palm_patch_local + self.palm_pos
+
         tips = []
         for finger in ['index3', 'middle3', 'ring3', 'pinky3', 'thumb3']:
             tip_pos = rot_mat @ ret[finger].get_matrix()[0, :3, 3] + self.palm_pos
@@ -88,9 +142,9 @@ class ManoChamferSDFOptimizer(nn.Module):
         vec_width = vec_width / (torch.norm(vec_width) + 1e-6)
         # 点积的绝对值越接近1越平行，所以用 1 - abs(dot)
         loss_align_width = 1.0 - torch.clamp(torch.abs(torch.sum(vec_width * h_long)), max=1.0)
-        
+
         # B. 手指出手方向 (从手掌根部到中指中段) -> 必须与把手垂直
-        vec_forward = mids_tensor[1] - self.palm_pos
+        vec_forward = mids_tensor[1] - palm_patch_world
         vec_forward = vec_forward / (torch.norm(vec_forward) + 1e-6)
         # 垂直意味着点积为 0
         loss_align_forward = torch.abs(torch.sum(vec_forward * h_long))
@@ -119,24 +173,22 @@ class ManoChamferSDFOptimizer(nn.Module):
         thumb_tip = tips_tensor[4]
         proj_thumb = torch.sum((thumb_tip - h_center) * h_out, dim=-1)
 
-        side_margin = 0.005  # 5mm：留出稳定接触的”夹持间隙”
+        side_margin = 0.003  # 更贴近把手，两侧包络而不是悬停
         # 四指如果跑到中平面前侧 -> 惩罚
         loss_fingers_side = torch.sum(torch.relu(proj_tips - (mid_proj - side_margin)))
         # 拇指如果没到中平面前侧 -> 惩罚
         loss_thumb_side = torch.relu((mid_proj + side_margin) - proj_thumb)
         loss_opposition = loss_fingers_side + loss_thumb_side
 
-        desired_back = mid_proj - 0.35 * (max_proj - min_proj + 1e-6)
+        desired_back = mid_proj - 0.55 * (max_proj - min_proj + 1e-6)
         loss_back_surface = torch.mean(torch.abs(proj_tips - desired_back)) + 0.5 * torch.mean(
             torch.abs(proj_mids - desired_back)
         )
 
-        deep_hook_margin = 0.010
+        deep_hook_margin = -0.001
         loss_anti_hook = torch.sum(torch.relu((min_proj - deep_hook_margin) - proj_tips))
 
-        # ----------------------------------------------------
-        # 🌟 新增：四指“同向/同形态”一致性（避免某根手指偏航去蹭点）
-        # ----------------------------------------------------
+
         # A. 四指 flexion（第 2/3 关节）尽量一致
         flex2 = self.qpos[self.four_finger_flex2]
         flex3 = self.qpos[self.four_finger_flex3]
@@ -163,7 +215,13 @@ class ManoChamferSDFOptimizer(nn.Module):
 
         proj_long_4 = torch.sum((tips_4 - h_center) * h_long, dim=-1)
         proj_long_thumb = torch.sum((thumb_tip - h_center) * h_long, dim=-1)
-        loss_centerline = torch.mean(torch.abs(proj_long_4)) + 0.5 * torch.abs(proj_long_thumb)
+        # Centre the four-finger GROUP on the handle, not each finger
+        # individually.  Fingers are side-by-side along h_long, so
+        # penalising each one's absolute offset from h_center biases
+        # the optimizer to extend only the index finger to h_center
+        # while the others (anatomically offset) curl into thin air.
+        group_center_long = torch.mean(proj_long_4)
+        loss_centerline = torch.abs(group_center_long) + 0.5 * torch.abs(proj_long_thumb)
 
         # ----------------------------------------------------
         # 🌟 新增：力闭合几何先验
@@ -194,28 +252,49 @@ class ManoChamferSDFOptimizer(nn.Module):
             + 0.8 * loss_closure_width
         )
 
+        # ----------------------------------------------------
+        # Normal-Assisted Projection Alignment: force middle/ring/pinky
+        # to match the index finger's depth along h_out so they wrap
+        # on the same plane instead of hovering rigidly.
+        # ----------------------------------------------------
+        proj_out_tips_4 = torch.sum((tips_4 - h_center) * h_out, dim=-1)    # (4,)
+        proj_out_mids_4 = torch.sum((mids_4 - h_center) * h_out, dim=-1)    # (4,)
+        ref_tip_depth = proj_out_tips_4[0]   # index finger tip as reference
+        ref_mid_depth = proj_out_mids_4[0]   # index finger mid as reference
+        loss_normal_align = (
+            torch.sum((proj_out_tips_4[1:] - ref_tip_depth) ** 2)
+            + 0.5 * torch.sum((proj_out_mids_4[1:] - ref_mid_depth) ** 2)
+        )
+
         # 3. 贴合与防穿透损失
         dists_tips = torch.cdist(tips_tensor, pc_tensor)
         dists_mids = torch.cdist(mids_tensor, pc_tensor)
         loss_chamfer = torch.mean(torch.min(dists_tips, dim=1)[0]) + 0.3 * torch.mean(torch.min(dists_mids, dim=1)[0])
 
-        # ----------------------------------------------------
-        # 🌟 Per-finger contact loss: each fingertip must be within
-        # a tight threshold of the handle surface.  Unlike chamfer
-        # (which averages), this penalises *every* finger that drifts.
-        # ----------------------------------------------------
-        contact_threshold = 0.008  # 8 mm — tighter than chamfer alone
+        contact_threshold = 0.015
         per_tip_min_dist = torch.min(dists_tips, dim=1)[0]          # (5,)
         per_mid_min_dist = torch.min(dists_mids, dim=1)[0]          # (5,)
-        # Penalise distance beyond threshold for each finger
         loss_tip_contact = torch.sum(torch.relu(per_tip_min_dist - contact_threshold))
         loss_mid_contact = torch.sum(torch.relu(per_mid_min_dist - contact_threshold * 2.0))
         loss_contact = loss_tip_contact + 0.5 * loss_mid_contact
 
-        door_plane_point = h_center + h_out * (min_proj - 0.0015)
-        all_joints = torch.cat([self.palm_pos.unsqueeze(0), mids_tensor, tips_tensor], dim=0)
-        signed_dists = torch.sum((all_joints - door_plane_point) * h_out, dim=-1)
-        loss_penetration = torch.sum(torch.relu(-signed_dists))
+        # Split penetration into palm (strict) vs fingers (relaxed).
+        # Fingertips and mid-phalanges must be allowed to curl past the
+        # handle back surface — a single flat plane blocks mid-transit
+        # phalanges and causes the "OK gesture" local optimum where only
+        # the index finger wraps.
+        door_plane_strict = h_center + h_out * (min_proj - 0.005)   # palm: tight
+        door_plane_finger = h_center + h_out * (min_proj - 0.025)   # fingers: generous
+
+        palm_joints = torch.stack([palm_center_world, palm_patch_world])  # (2, 3)
+        palm_signed = torch.sum((palm_joints - door_plane_strict) * h_out, dim=-1)
+        loss_pen_palm = torch.sum(torch.relu(-palm_signed))
+
+        finger_joints = torch.cat([mids_tensor, tips_tensor], dim=0)      # (10, 3)
+        finger_signed = torch.sum((finger_joints - door_plane_finger) * h_out, dim=-1)
+        loss_pen_finger = torch.sum(torch.relu(-finger_signed))
+
+        loss_penetration = loss_pen_palm + 0.3 * loss_pen_finger
 
         # 4. 关节极限与闭合
         loss_limits = torch.sum(torch.relu(self.qpos - self.q_limits[:, 1])) + \
@@ -226,19 +305,22 @@ class ManoChamferSDFOptimizer(nn.Module):
         loss_closure = torch.sum(torch.relu(closure_target - q_flexion))
 
         # 5. 锚定与旋转死锁
-        # Anchor offset proportional to handle thickness instead of fixed 3cm
+        # Anchor the palm patch just outside the front handle surface.
+        # `h_center` is already the front-face center, so large offsets keep
+        # the hand hovering in front of the handle and reproduce the ~3cm gap
+        # seen in rollout logs.
         handle_thickness = max_proj - min_proj + 1e-6
-        anchor_offset = torch.clamp(handle_thickness * 0.4, min=0.005, max=0.025)
+        anchor_offset = torch.clamp(handle_thickness * 0.06, min=0.0015, max=0.0060)
         target_palm_pos = h_center + h_out * anchor_offset
-        loss_anchor = torch.norm(self.palm_pos - target_palm_pos)
+        loss_anchor = torch.norm(palm_patch_world - target_palm_pos)
         norm_rot = self.palm_rot / (torch.norm(self.palm_rot) + 1e-6)
         init_rot = self.init_palm_rot / (torch.norm(self.init_palm_rot) + 1e-6)
         loss_rot = 1.0 - torch.clamp(torch.sum(norm_rot * init_rot)**2, max=1.0)
 
         weight_rot = 30.0 * (1.0 - alpha) + 2.0 * alpha       # 旋转死锁逐渐放开
         weight_anchor = 10.0 * (1.0 - alpha) + 2.0 * alpha    # 锚定限制逐渐变弱
-        weight_back_surface = 80.0 * (1.0 - alpha) + 160.0 * alpha
-        weight_anti_hook = 150.0 * (1.0 - alpha) + 260.0 * alpha
+        weight_back_surface = 120.0 * (1.0 - alpha) + 220.0 * alpha
+        weight_anti_hook = 30.0 * (1.0 - alpha) + 60.0 * alpha
         weight_closure = 8.0 * (1.0 - alpha) + 40.0 * alpha
         weight_align = 150.0 * (1.0 - alpha) + 50.0 * alpha
         weight_consistency = 20.0 * (1.0 - alpha) + 60.0 * alpha
@@ -250,9 +332,11 @@ class ManoChamferSDFOptimizer(nn.Module):
         # late stages enforce tight surface contact
         weight_chamfer = 40.0 * (1.0 - alpha) + 120.0 * alpha
         weight_contact = 80.0 * (1.0 - alpha) + 300.0 * alpha
+        weight_normal_align = 80.0 * (1.0 - alpha) + 350.0 * alpha
 
         total_loss = weight_chamfer * loss_chamfer + \
                      weight_contact * loss_contact + \
+                     weight_normal_align * loss_normal_align + \
                      weight_back_surface * loss_back_surface + \
                      weight_anti_hook * loss_anti_hook + \
                      weight_opposition * loss_opposition + \
